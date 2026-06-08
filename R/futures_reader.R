@@ -35,7 +35,7 @@ read_futures_csv <- function(path) {
 
   # First column is timestamp
   setnames(dt, 1, "timestamp")
-  dt[, timestamp := with_tz(ymd_hms(timestamp), "UTC")]
+  dt[, timestamp := with_tz(timestamp, "UTC")]
 
   # Parse column names: "c1||weighted_mid" -> contract="c1", field="weighted_mid"
   raw_cols  <- colnames(dt)[-1]   # exclude timestamp
@@ -95,17 +95,17 @@ get_prices <- function(ff,
   all_contracts <- attr(ff, "contracts")
   if (is.null(contracts)) contracts <- all_contracts
 
-  # Extract weighted_mid columns
+  # Extract weighted_mid columns using indices (avoids || in col names)
+  all_cols   <- colnames(ff)
   price_cols <- paste0(contracts, SEP, "weighted_mid")
-  keep_cols  <- c("timestamp", price_cols)
-  # Only keep cols that exist
-  keep_cols  <- keep_cols[keep_cols %in% colnames(ff)]
+  price_cols <- price_cols[price_cols %in% all_cols]
+  keep_idx   <- which(all_cols %in% c("timestamp", price_cols))
 
-  dt <- ff[, ..keep_cols]
+  dt <- ff[, keep_idx, with = FALSE]
 
   # Rename: "c1||weighted_mid" -> "c1"
   old_names <- price_cols[price_cols %in% colnames(dt)]
-  new_names <- sub(paste0(SEP, "weighted_mid"), "", old_names)
+  new_names <- gsub(paste0("\\|\\|weighted_mid"), "", old_names)
   setnames(dt, old_names, new_names)
 
   # Date filter
