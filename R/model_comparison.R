@@ -58,7 +58,7 @@ compare_models <- function(data, bp_breaks,
     after_signals <- models_new$signals
   } else {
     cat("Building AFTER (adjusted) models...\n")
-    source("R/regime_models.R")
+    source("R/regime_models_treated.R")
     models_new    <- run_parallel_models(data, bp_breaks, series)
     after_signals <- models_new$signals
   }
