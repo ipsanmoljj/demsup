@@ -55,9 +55,9 @@ library(zoo)
 # confirmed break date. This prevents the classifier from confidently labelling
 # a period that is structurally changing.
 
-TRANSITION_WINDOW <- 10   # bars either side of a break date = transition zone
-KALMAN_SLOPE_WINDOW <- 5  # bars to compute Kalman slope over
-KALMAN_SLOPE_THRESH <- 0.02  # minimum slope magnitude to count as rising/falling
+TRANSITION_WINDOW <- 5   # bars either side of a break date = transition zone
+KALMAN_SLOPE_WINDOW <- 10  # bars to compute Kalman slope over
+KALMAN_SLOPE_THRESH <- 0.05  # minimum slope magnitude to count as rising/falling
 HIGH_STATE_RANK <- 0.6    # top 40% of Markov states by mean = "high"
 LOW_STATE_RANK  <- 0.4    # bottom 40% = "low"
 
@@ -224,8 +224,10 @@ classify_regimes <- function(product = "CL",
     dt[idx, days_to_next_break := as.numeric(epoch_end - date)]
 
     # Near-break flag: within TRANSITION_WINDOW bars of either boundary
-    dt[idx, near_break := (days_since_break <= TRANSITION_WINDOW |
-                            days_to_next_break <= TRANSITION_WINDOW)]
+    epoch_len <- as.numeric(epoch_end - epoch_start)
+    adaptive_window <- min(TRANSITION_WINDOW, floor(epoch_len * 0.15))
+    dt[idx, near_break := (days_since_break  <= adaptive_window |
+                            days_to_next_break <= adaptive_window)]
 
     # Break direction: M1M2 mean before vs after epoch_end
     if (i < length(boundaries) - 1 && epoch_end < as.Date("2099-01-01")) {
