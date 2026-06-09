@@ -1,9 +1,9 @@
-break_date,BP,KF,MS,ARIMA,n_models,confidence,direction,delta_M1M2,regime_after
-2022-01-24,YES,---,YES,YES,3,HIGH,↑ tighter,1.4,deep_backwardation
-2022-05-05,YES,---,---,YES,2,MEDIUM,↑ tighter,1.16,deep_backwardation
-2022-08-01,YES,---,YES,YES,3,HIGH,↓ looser,-2.14,mild_backwardation
-2022-11-16,YES,---,YES,YES,3,HIGH,↓ looser,-1.259,flat
-2023-07-20,YES,---,YES,YES,3,HIGH,↑ tighter,0.608,mild_backwardation
-2023-10-31,YES,---,YES,YES,3,HIGH,↓ looser,-1.528,flat
-2024-02-13,YES,---,YES,YES,3,HIGH,↑ tighter,0.597,mild_backwardation
-2026-02-07,YES,---,---,YES,2,MEDIUM,↑ tighter,0.648,deep_backwardation
+break_date,BP,KF,MS,ARIMA,n_models,confidence,direction,delta_M1M2,MS_prob_back,regime_after
+2022-01-24,YES,---,YES,---,2,MEDIUM,tighter,1.4,0.976,deep_backwardation
+2022-05-05,YES,---,---,---,1,LOW,tighter,1.16,1,deep_backwardation
+2022-08-01,YES,---,YES,---,2,MEDIUM,looser,-2.14,0.019,mild_backwardation
+2022-11-16,YES,---,YES,---,2,MEDIUM,looser,-1.259,0.056,flat
+2023-07-20,YES,---,YES,---,2,MEDIUM,tighter,0.608,0,mild_backwardation
+2023-10-31,YES,---,YES,---,2,MEDIUM,looser,-1.528,0.035,flat
+2024-02-13,YES,---,YES,---,2,MEDIUM,tighter,0.597,0.024,mild_backwardation
+2026-02-07,YES,---,---,---,1,LOW,tighter,0.648,0.346,mild_backwardation

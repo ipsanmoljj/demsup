@@ -1,0 +1,12 @@
+model,metric,better_if,before,after,change,verdict
+KF,Innovation normality (JB p-value),higher,0,0,NANaN%,NO CHANGE
+KF,Residual variance,lower,0.5102,1,+96%,NO CHANGE
+KF,Rolling variance ratio,lower,30588.0898,29040.5573,-5.1%,IMPROVED
+ARIMA,AIC per observation,lower,0.8411,0.4381,-47.9%,IMPROVED
+ARIMA,Ljung-Box p (residuals),higher,0,0.4659,+1146328409.2%,IMPROVED
+MS,Regime persistence (days),higher,91.9474,36.3958,-60.4%,NO CHANGE
+MS,Spurious transition rate,lower,0,0.1489,+Inf%,NO CHANGE
+MS,BP break agreement,higher,0.25,0.875,+250%,IMPROVED
+ALL,Signal-to-noise ratio,higher,0.7379,0.7379,0%,NO CHANGE
+ALL,Regime separation,higher,1.4119,1.4119,0%,NO CHANGE
+ALL,Within-regime variance,lower,2.3626,2.3626,0%,NO CHANGE
