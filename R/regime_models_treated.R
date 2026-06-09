@@ -249,8 +249,8 @@ run_parallel_models <- function(data,
   probs      <- ms_fit@Fit@smoProb[-1, , drop=FALSE]
   states     <- apply(probs, 1, which.max)
   state_means <- ms_fit@Coef[, "(Intercept)"]
-  state_sds   <- sqrt(ms_fit@Coef[, "sigma2"])
-
+  state_sds   <- ms_fit@std
+  
   # Order states by mean
   state_order <- order(state_means)
   labels      <- character(n_states)
