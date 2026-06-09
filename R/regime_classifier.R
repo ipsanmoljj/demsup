@@ -175,7 +175,7 @@ classify_regimes <- function(product = "CL",
   cm[, agreement_weight := n_models / 4]
 
   # ── Compute Kalman slope (rolling slope of kf_mean) ──────────────────────
-  kf[, kf_slope := c(rep(NA, KALMAN_SLOPE_WINDOW - 1),
+  kf[, kf_slope := c(rep(NA, KALMAN_SLOPE_WINDOW),
                       diff(kf_mean, lag = KALMAN_SLOPE_WINDOW))]
 
   # ── Normalise Markov state to 0–1 rank ───────────────────────────────────
