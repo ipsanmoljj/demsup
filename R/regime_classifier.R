@@ -493,26 +493,36 @@ plot_regime_labels <- function(labels_result,
     "Contango-Surplus"       = "#2C3E50"    # dark navy
   )
 
-  # Short label abbreviations for text annotation inside bands
-  label_short <- c(
-    "Backwardation-Deficit"  = "BACK\nDEFICIT",
-    "Stable-Elevated"        = "STABLE\nHIGH",
-    "Transition-Tightening"  = "TRANS\n↑",
-    "Transition-Loosening"   = "TRANS\n↓",
-    "Stable-Depressed"       = "STABLE\nLOW",
-    "Contango-Surplus"       = "CONT\nSURPLUS"
+  # Two-line label text — rendered as two separate text() calls
+  # (base R does not support \n in text(); stacking done via y offset)
+  label_line1 <- c(
+    "Backwardation-Deficit"  = "BACK-",
+    "Stable-Elevated"        = "STABLE",
+    "Transition-Tightening"  = "TRANS",
+    "Transition-Loosening"   = "TRANS",
+    "Stable-Depressed"       = "STABLE",
+    "Contango-Surplus"       = "CONT-"
+  )
+  label_line2 <- c(
+    "Backwardation-Deficit"  = "DEFICIT",
+    "Stable-Elevated"        = "HIGH",
+    "Transition-Tightening"  = "TIGHTEN",
+    "Transition-Loosening"   = "LOOSEN",
+    "Stable-Depressed"       = "LOW",
+    "Contango-Surplus"       = "SURPLUS"
   )
 
-  png(save_path, width = 1800, height = 1000, res = 120)
-  par(mfrow = c(2, 1), mar = c(2, 4.5, 3, 2), oma = c(3, 0, 3, 0), bg = "white")
+  png(save_path, width = 1800, height = 1100, res = 120)
+  par(mfrow = c(2, 1), mar = c(2, 4.5, 5, 2), oma = c(3, 0, 3, 0), bg = "white")
 
   times  <- as.POSIXct(out$date)
 
   # ── Panel 1: M1M2 with coloured bands + text labels ──────────────────────
   y_range <- range(out$M1M2, na.rm = TRUE)
-  y_pad   <- diff(y_range) * 0.08
-  y_min   <- y_range[1] - y_pad
-  y_max   <- y_range[2] + y_pad * 3   # extra top margin for label text
+  y_span  <- diff(y_range)
+  y_min   <- y_range[1] - y_span * 0.05
+  y_max   <- y_range[2] + y_span * 0.55   # large headroom above price for labels
+  line_h  <- y_span * 0.09                # vertical gap between two text lines
 
   plot(times, out$M1M2, type = "n",
        main = paste0(product, " — M1M2 spread with regime labels"),
@@ -534,37 +544,40 @@ plot_regime_labels <- function(labels_result,
     t_mid    <- as.POSIXct(mean(as.numeric(c(t_start, t_end)),
                                 na.rm = TRUE), origin = "1970-01-01")
 
-    # Coloured background band
+    # Coloured background band (full height including label headroom)
     rect(t_start, y_min, t_end, y_max,
          col = adjustcolor(ep_col, 0.13), border = NA)
 
     # Thin vertical border at epoch start
-    abline(v = t_start, col = adjustcolor(ep_col, 0.5), lwd = 0.6, lty = 1)
+    abline(v = t_start, col = adjustcolor(ep_col, 0.45), lwd = 0.6, lty = 1)
 
-    # Text label at top of band — only if epoch is wide enough (>= 10 bars)
+    # Text labels — only for epochs wide enough to fit (>= 10 bars)
     if (nrow(ep_rows) >= 10) {
-      short_txt <- label_short[ep_label]
-      if (!is.na(short_txt)) {
-        text(t_mid,
-             y_max - y_pad * 0.6,
-             labels   = short_txt,
-             cex      = 0.52,
-             col      = adjustcolor(ep_col, 0.9),
-             font     = 2,
-             adj      = c(0.5, 1),
-             srt      = 0)
-      }
-    }
+      l1      <- label_line1[ep_label]
+      l2      <- label_line2[ep_label]
+      txt_col <- ep_col
+      y_top   <- y_range[2] + y_span * 0.42
 
-    # Mean confidence score annotated below the label (small grey text)
-    if (nrow(ep_rows) >= 15) {
-      mean_conf <- round(mean(ep_rows$confidence_score, na.rm = TRUE), 2)
-      text(t_mid,
-           y_max - y_pad * 1.8,
-           labels = paste0("conf:", mean_conf),
-           cex    = 0.42,
-           col    = "gray45",
-           adj    = c(0.5, 1))
+      # Line 1 (e.g. "BACK-")
+      text(t_mid, y_top,
+           labels = l1, cex = 0.60, col = txt_col, font = 2, adj = c(0.5, 0.5))
+
+      # Line 2 (e.g. "DEFICIT")
+      text(t_mid, y_top - line_h,
+           labels = l2, cex = 0.60, col = txt_col, font = 2, adj = c(0.5, 0.5))
+
+      # Confidence score below
+      if (nrow(ep_rows) >= 15) {
+        mean_conf <- round(mean(ep_rows$confidence_score, na.rm = TRUE), 2)
+        text(t_mid, y_top - line_h * 2.1,
+             labels = paste0("conf:", mean_conf),
+             cex = 0.46, col = "gray40", adj = c(0.5, 0.5))
+      }
+
+      # Small tick line to separate label zone from price zone
+      segments(t_start, y_range[2] + y_span * 0.07,
+               t_end,   y_range[2] + y_span * 0.07,
+               col = adjustcolor(ep_col, 0.4), lwd = 0.5)
     }
   }
 
