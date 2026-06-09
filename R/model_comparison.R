@@ -101,28 +101,30 @@ compare_models <- function(data, bp_breaks,
 .build_before_models <- function(y_c, ts_c, bp_breaks) {
   library(KFAS); library(forecast)
 
-  # KF BEFORE: constant H, no winsorisation
-  # Use fixed variances to avoid NA/Inf issues with extreme raw data
-  cat("  KF (constant H, no winsorisation)...\n")
-  y_var <- var(y_c, na.rm=TRUE)
-  # Cap initial variance at reasonable value to avoid SSModel NA error
-  h_init <- min(y_var, 100)
-  q_init <- min(y_var * 0.1, 10)
+  # KF BEFORE: rolling-window KF (fair baseline)
+  # Uses rolling 63-day variance as H schedule (same as after)
+  # but WITHOUT winsorisation and WITHOUT MLE-fitted Q
+  # Isolates the effect of winsorisation + MLE Q estimation
+  cat("  KF (rolling-window baseline, no winsorisation)...\n")
+
+  roll_var_raw <- zoo::rollapply(y_c, 63, var, fill=NA, align="right")
+  first_var    <- roll_var_raw[!is.na(roll_var_raw)][1]
+  roll_var_raw[is.na(roll_var_raw)] <- first_var
+  roll_var_raw <- pmax(roll_var_raw, 1e-6)
+
+  # Fixed Q = median rolling variance * 0.05 (no MLE, no winsorisation)
+  q_fixed <- median(roll_var_raw, na.rm=TRUE) * 0.05
+  H_array_raw <- array(roll_var_raw, dim=c(1,1,length(y_c)))
+
   model_before <- tryCatch(
-    SSModel(y_c ~ SSMtrend(1, Q=list(matrix(q_init))),
-            H=matrix(h_init)),
+    SSModel(y_c ~ SSMtrend(1, Q=list(matrix(q_fixed))),
+            H = H_array_raw),
     error = function(e) {
-      cat("  KF-before SSModel failed — using simplified version\n")
-      SSModel(y_c ~ SSMtrend(1, Q=list(matrix(0.1))), H=matrix(1.0))
+      cat("  KF-before rolling failed — falling back to capped constant H\n")
+      SSModel(y_c ~ SSMtrend(1, Q=list(matrix(0.05))), H=matrix(1.0))
     }
   )
-  fit_before <- tryCatch(
-    fitSSM(model_before,
-           inits  = c(log(q_init), log(h_init)),
-           method = "L-BFGS-B"),
-    error = function(e) list(model=model_before)
-  )
-  kfs_before   <- KFS(fit_before$model)
+  kfs_before   <- KFS(model_before)
   mu_before    <- as.numeric(kfs_before$alphahat[,"level"])
   innov_before <- tryCatch(as.numeric(kfs_before$v[,1]),
                             error=function(e) rep(NA_real_, length(y_c)))
