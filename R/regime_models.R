@@ -75,6 +75,15 @@ run_parallel_models <- function(data,
   cat("\n--- CONSENSUS MATRIX ---\n\n")
   print(consensus)
 
+  # ── Persist model outputs for downstream classifier ─────────────────────
+  dir.create("output", showWarnings = FALSE)
+  saveRDS(kf_result,  "output/model_kf.rds")
+  saveRDS(ms_result,  "output/model_ms.rds")
+  saveRDS(ar_result,  "output/model_arima.rds")
+  saveRDS(bp_breaks,  "output/model_bp_breaks.rds")
+  saveRDS(signals,    "output/model_signals.rds")
+  cat("\nModel outputs saved to output/\n")
+  
   list(
     signals          = signals,
     consensus_matrix = consensus,
