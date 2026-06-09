@@ -175,7 +175,7 @@ classify_regimes <- function(product = "CL",
   cm[, agreement_weight := n_models / 4]
 
   # ── Compute Kalman slope (rolling slope of kf_mean) ──────────────────────
-  kf[, kf_slope := c(rep(NA, KALMAN_SLOPE_WINDOW - 1),
+  kf[, kf_slope := c(rep(NA, KALMAN_SLOPE_WINDOW),
                       diff(kf_mean, lag = KALMAN_SLOPE_WINDOW))]
 
   # ── Normalise Markov state to 0–1 rank ───────────────────────────────────
@@ -223,9 +223,10 @@ classify_regimes <- function(product = "CL",
     dt[idx, days_since_break  := as.numeric(date - epoch_start)]
     dt[idx, days_to_next_break := as.numeric(epoch_end - date)]
 
-    # Near-break flag: within TRANSITION_WINDOW bars of either boundary
-    epoch_len <- as.numeric(epoch_end - epoch_start)
-    adaptive_window <- min(TRANSITION_WINDOW, floor(epoch_len * 0.15))
+    # Near-break flag: adaptive window = min(TRANSITION_WINDOW, 15% of epoch length)
+    # Prevents short epochs being entirely consumed by transition labels
+    epoch_len        <- as.numeric(epoch_end - epoch_start)
+    adaptive_window  <- min(TRANSITION_WINDOW, max(2, floor(epoch_len * 0.15)))
     dt[idx, near_break := (days_since_break  <= adaptive_window |
                             days_to_next_break <= adaptive_window)]
 
@@ -482,7 +483,7 @@ plot_regime_labels <- function(labels_result,
   product <- labels_result$product
 
   if (is.null(save_path)) {
-    save_path <- paste0("output/regime_labels_", product, "_plot_v2.png")
+    save_path <- paste0("output/regime_labels_", product, "_plot_v3.png")
   }
 
   # Colour map for narrative labels
