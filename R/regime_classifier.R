@@ -175,7 +175,7 @@ classify_regimes <- function(product = "CL",
   cm[, agreement_weight := n_models / 4]
 
   # ── Compute Kalman slope (rolling slope of kf_mean) ──────────────────────
-  kf[, kf_slope := c(rep(NA, KALMAN_SLOPE_WINDOW),
+  kf[, kf_slope := c(rep(NA, KALMAN_SLOPE_WINDOW - 1),
                       diff(kf_mean, lag = KALMAN_SLOPE_WINDOW))]
 
   # ── Normalise Markov state to 0–1 rank ───────────────────────────────────
@@ -480,7 +480,7 @@ plot_regime_labels <- function(labels_result,
   product <- labels_result$product
 
   if (is.null(save_path)) {
-    save_path <- paste0("output/regime_labels_", product, "_plot.png")
+    save_path <- paste0("output/regime_labels_", product, "_plot_v2.png")
   }
 
   # Colour map for narrative labels
@@ -493,63 +493,139 @@ plot_regime_labels <- function(labels_result,
     "Contango-Surplus"       = "#2C3E50"    # dark navy
   )
 
-  png(save_path, width = 1600, height = 900, res = 120)
+  # Short label abbreviations for text annotation inside bands
+  label_short <- c(
+    "Backwardation-Deficit"  = "BACK\nDEFICIT",
+    "Stable-Elevated"        = "STABLE\nHIGH",
+    "Transition-Tightening"  = "TRANS\n↑",
+    "Transition-Loosening"   = "TRANS\n↓",
+    "Stable-Depressed"       = "STABLE\nLOW",
+    "Contango-Surplus"       = "CONT\nSURPLUS"
+  )
+
+  png(save_path, width = 1800, height = 1000, res = 120)
   par(mfrow = c(2, 1), mar = c(2, 4.5, 3, 2), oma = c(3, 0, 3, 0), bg = "white")
 
   times  <- as.POSIXct(out$date)
-  labels <- out$regime_label
-  cols   <- label_colours[labels]
-  cols[is.na(cols)] <- "gray70"
 
-  # Panel 1: M1M2 coloured by regime label
+  # ── Panel 1: M1M2 with coloured bands + text labels ──────────────────────
+  y_range <- range(out$M1M2, na.rm = TRUE)
+  y_pad   <- diff(y_range) * 0.08
+  y_min   <- y_range[1] - y_pad
+  y_max   <- y_range[2] + y_pad * 3   # extra top margin for label text
+
   plot(times, out$M1M2, type = "n",
-       main = paste0(product, " — M1M2 coloured by regime label"),
-       xlab = "", ylab = "M1M2 ($/bbl)", xaxt = "n", las = 1, cex.main = 0.9)
+       main = paste0(product, " — M1M2 spread with regime labels"),
+       xlab = "", ylab = "M1M2 ($/bbl)", xaxt = "n", las = 1,
+       ylim = c(y_min, y_max), cex.main = 0.9)
 
-  # Draw coloured background bands per regime epoch
   unique_epochs <- unique(out$regime_id)
+
+  for (ep in unique_epochs) {
+    ep_rows  <- out[regime_id == ep]
+    if (nrow(ep_rows) == 0) next
+
+    ep_label <- ep_rows$regime_label[1]
+    ep_col   <- label_colours[ep_label]
+    if (is.na(ep_col)) ep_col <- "gray80"
+
+    t_start  <- as.POSIXct(min(ep_rows$date)) - 43200
+    t_end    <- as.POSIXct(max(ep_rows$date)) + 43200
+    t_mid    <- as.POSIXct(mean(as.numeric(c(t_start, t_end)),
+                                na.rm = TRUE), origin = "1970-01-01")
+
+    # Coloured background band
+    rect(t_start, y_min, t_end, y_max,
+         col = adjustcolor(ep_col, 0.13), border = NA)
+
+    # Thin vertical border at epoch start
+    abline(v = t_start, col = adjustcolor(ep_col, 0.5), lwd = 0.6, lty = 1)
+
+    # Text label at top of band — only if epoch is wide enough (>= 10 bars)
+    if (nrow(ep_rows) >= 10) {
+      short_txt <- label_short[ep_label]
+      if (!is.na(short_txt)) {
+        text(t_mid,
+             y_max - y_pad * 0.6,
+             labels   = short_txt,
+             cex      = 0.52,
+             col      = adjustcolor(ep_col, 0.9),
+             font     = 2,
+             adj      = c(0.5, 1),
+             srt      = 0)
+      }
+    }
+
+    # Mean confidence score annotated below the label (small grey text)
+    if (nrow(ep_rows) >= 15) {
+      mean_conf <- round(mean(ep_rows$confidence_score, na.rm = TRUE), 2)
+      text(t_mid,
+           y_max - y_pad * 1.8,
+           labels = paste0("conf:", mean_conf),
+           cex    = 0.42,
+           col    = "gray45",
+           adj    = c(0.5, 1))
+    }
+  }
+
+  # Price line and zero reference
+  lines(times, out$M1M2, col = "gray20", lwd = 0.9)
+  abline(h = 0, lty = 2, col = "gray55", lwd = 0.5)
+
+  # Kalman mean overlay (dashed, same panel)
+  lines(times, out$kf_mean, col = "#185FA5", lwd = 1.0, lty = 2)
+
+  axis.POSIXct(1, at = seq(min(times), max(times), by = "6 months"),
+               format = "%b %Y", cex.axis = 0.7, las = 2)
+
+  # Legend — bottom left to avoid overlap with labels at top
+  present_labels <- intersect(names(label_colours), unique(out$regime_label))
+  legend("bottomleft",
+         legend = c(present_labels, "Kalman mean"),
+         fill   = c(adjustcolor(label_colours[present_labels], 0.5), NA),
+         lty    = c(rep(NA, length(present_labels)), 2),
+         lwd    = c(rep(NA, length(present_labels)), 1.2),
+         col    = c(rep(NA, length(present_labels)), "#185FA5"),
+         border = c(rep("gray70", length(present_labels)), NA),
+         cex    = 0.6, bty = "n", ncol = 3)
+
+  # ── Panel 2: Confidence score coloured by regime ──────────────────────────
+  plot(times, out$confidence_score, type = "n",
+       main = paste0(product, " — Confidence score per bar (coloured by regime)"),
+       xlab = "", ylab = "Confidence (0–1)", xaxt = "n", las = 1,
+       ylim = c(0, 1.05), cex.main = 0.9)
+
+  # Shade confidence area with regime colour
   for (ep in unique_epochs) {
     ep_rows <- out[regime_id == ep]
     if (nrow(ep_rows) == 0) next
     ep_label <- ep_rows$regime_label[1]
     ep_col   <- label_colours[ep_label]
-    if (is.na(ep_col)) ep_col <- "gray90"
-    rect(as.POSIXct(min(ep_rows$date)) - 43200,
-         par("usr")[3],
-         as.POSIXct(max(ep_rows$date)) + 43200,
-         par("usr")[4],
-         col = adjustcolor(ep_col, 0.12), border = NA)
+    if (is.na(ep_col)) ep_col <- "gray70"
+    ep_times <- as.POSIXct(ep_rows$date)
+    ep_conf  <- ep_rows$confidence_score
+    polygon(c(ep_times, rev(ep_times)),
+            c(ep_conf, rep(0, length(ep_conf))),
+            col = adjustcolor(ep_col, 0.25), border = NA)
   }
 
-  lines(times, out$M1M2, col = "gray30", lwd = 0.8)
-  abline(h = 0, lty = 2, col = "gray60", lwd = 0.5)
-  axis.POSIXct(1, at = seq(min(times), max(times), by = "6 months"),
-               format = "%b %Y", cex.axis = 0.7, las = 2)
+  # Confidence line on top
+  lines(times, out$confidence_score, col = "gray25", lwd = 0.7)
 
-  # Legend
-  present_labels <- intersect(names(label_colours), unique(labels))
-  legend("topright", legend = present_labels,
-         fill = adjustcolor(label_colours[present_labels], 0.5),
-         cex = 0.65, bty = "n", ncol = 2)
-
-  # Panel 2: Confidence score
-  plot(times, out$confidence_score, type = "l", col = "#6B2D8B", lwd = 0.8,
-       main = paste0(product, " — Confidence score per bar"),
-       xlab = "", ylab = "Confidence (0–1)", xaxt = "n", las = 1,
-       ylim = c(0, 1), cex.main = 0.9)
-  abline(h = c(0.5, 0.75), lty = 2, col = c("gray50", "gray30"), lwd = 0.5)
-  polygon(c(times, rev(times)),
-          c(out$confidence_score, rep(0, nrow(out))),
-          col = adjustcolor("#6B2D8B", 0.12), border = NA)
-  text(max(times), 0.77, "HIGH", cex = 0.6, col = "gray30", adj = 1)
+  # Threshold lines
+  abline(h = c(0.50, 0.75), lty = 2,
+         col = c("gray55", "gray30"), lwd = 0.6)
+  text(max(times), 0.77, "HIGH",   cex = 0.6, col = "gray30", adj = 1)
   text(max(times), 0.52, "MEDIUM", cex = 0.6, col = "gray30", adj = 1)
+  text(max(times), 0.27, "LOW",    cex = 0.6, col = "gray30", adj = 1)
+
   axis.POSIXct(1, at = seq(min(times), max(times), by = "6 months"),
                format = "%b %Y", cex.axis = 0.7, las = 2)
 
   mtext(paste0("Regime classification — ", product),
         side = 3, outer = TRUE, cex = 1.0, font = 2, line = 1.5)
-  mtext("Background shading = regime epoch; confidence bands at 0.50 and 0.75",
-        side = 1, outer = TRUE, cex = 0.7, line = 1.5)
+  mtext("Top panel: coloured bands = regime epoch; dashed blue = Kalman mean | Bottom: confidence score shaded by regime",
+        side = 1, outer = TRUE, cex = 0.65, line = 1.5)
 
   dev.off()
   cat("Saved:", save_path, "\n")
