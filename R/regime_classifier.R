@@ -55,16 +55,17 @@ library(zoo)
 # confirmed break date. This prevents the classifier from confidently labelling
 # a period that is structurally changing.
 
-TRANSITION_WINDOW <- 5   # bars either side of a break date = transition zone
-KALMAN_SLOPE_WINDOW <- 10  # bars to compute Kalman slope over
-KALMAN_SLOPE_THRESH <- 0.05  # minimum slope magnitude to count as rising/falling
-HIGH_STATE_RANK <- 0.6    # top 40% of Markov states by mean = "high"
-LOW_STATE_RANK  <- 0.4    # bottom 40% = "low"
+TRANSITION_WINDOW    <- 5    # bars either side of a break date = transition zone
+KALMAN_SLOPE_WINDOW  <- 10   # bars to compute Kalman slope over
+KALMAN_SLOPE_THRESH  <- 0.05 # minimum slope magnitude to count as rising/falling
+LEVEL_Z_WINDOW       <- 126  # 6-month rolling window for level z-score (scale-independent)
+LEVEL_Z_HIGH_THRESH  <-  0.5 # above this z-score = "high tier" (above 6-month norm)
+LEVEL_Z_LOW_THRESH   <- -0.5 # below this z-score = "low tier"  (below 6-month norm)
 
 # ── Assign narrative label to a single bar ────────────────────────────────────
 
 .assign_label <- function(kalman_slope,
-                           markov_state_rank,   # 0=lowest mean, 1=highest mean
+                           level_z_126,         # 6-month rolling z-score of M1M2 (scale-independent)
                            near_break,          # logical: within transition window
                            break_direction) {   # "up" or "down" if near_break
 
@@ -74,20 +75,29 @@ LOW_STATE_RANK  <- 0.4    # bottom 40% = "low"
                   "Transition-Loosening"))
   }
 
-  # Determine level tier from Markov state rank
-  level_tier <- ifelse(markov_state_rank >= HIGH_STATE_RANK, "high",
-                ifelse(markov_state_rank <= LOW_STATE_RANK,  "low", "mid"))
+  # Determine level tier from 6-month rolling z-score
+  # This is scale-independent: works for CL ($/bbl), LGO ($/mt), HO ($/gallon)
+  # "high" = M1M2 above its own 6-month average → market tighter than recent norm
+  # "low"  = M1M2 below its own 6-month average → market looser than recent norm
+  level_tier <- ifelse(level_z_126 >= LEVEL_Z_HIGH_THRESH, "high",
+                ifelse(level_z_126 <= LEVEL_Z_LOW_THRESH,  "low", "mid"))
 
-  # Combine slope + level tier
-  if (kalman_slope > KALMAN_SLOPE_THRESH  && level_tier == "high") return("Backwardation-Deficit")
-  if (kalman_slope > KALMAN_SLOPE_THRESH  && level_tier == "mid")  return("Backwardation-Deficit")
-  if (kalman_slope < -KALMAN_SLOPE_THRESH && level_tier == "low")  return("Contango-Surplus")
-  if (kalman_slope < -KALMAN_SLOPE_THRESH && level_tier == "mid")  return("Contango-Surplus")
+  # Combine slope + level tier → narrative label
+  #
+  # Rising slope + high/mid level  = actively tightening market
+  # Falling slope + low/mid level  = actively loosening market
+  # Flat slope + high level        = tight but stable (plateau)
+  # Flat slope + low level         = loose but stable (floor)
+  # Flat slope + mid level         = balanced market
+  if (kalman_slope > KALMAN_SLOPE_THRESH  && level_tier != "low")  return("Backwardation-Deficit")
+  if (kalman_slope > KALMAN_SLOPE_THRESH  && level_tier == "low")  return("Stable-Depressed")
+  if (kalman_slope < -KALMAN_SLOPE_THRESH && level_tier != "high") return("Contango-Surplus")
+  if (kalman_slope < -KALMAN_SLOPE_THRESH && level_tier == "high") return("Stable-Elevated")
   if (level_tier == "high")                                         return("Stable-Elevated")
   if (level_tier == "low")                                          return("Stable-Depressed")
 
-  # Middle tier, flat slope → use level z-score direction
-  "Stable-Elevated"   # default (will be overridden by z-score layer below)
+  # Mid tier, flat slope → balanced market, use slight slope bias
+  ifelse(kalman_slope >= 0, "Stable-Elevated", "Stable-Depressed")
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -178,14 +188,24 @@ classify_regimes <- function(product = "CL",
   kf[, kf_slope := c(rep(NA, KALMAN_SLOPE_WINDOW),
                       diff(kf_mean, lag = KALMAN_SLOPE_WINDOW))]
 
-  # ── Normalise Markov state to 0–1 rank ───────────────────────────────────
-  if ("ms_state" %in% names(ms) && !all(is.na(ms$ms_state))) {
-    n_states   <- max(ms$ms_state, na.rm = TRUE)
-    ms[, ms_state_rank := (ms_state - 1) / pmax(1, n_states - 1)]
-  } else {
-    # No Markov states available — derive rank from Kalman z-score
-    ms[, ms_state_rank := pmin(1, pmax(0, (kf$kf_z + 3) / 6))]
+  # ── Compute 126-day rolling z-score of M1M2 (scale-independent level tier) ──
+  # This replaces Markov state rank as the level indicator.
+  # Uses the raw M1M2 series directly — no unit assumptions.
+  # A z-score > +0.5 means "above 6-month norm" regardless of product units.
+  y_raw      <- signals$M1M2
+  roll_mean  <- zoo::rollmean(y_raw, LEVEL_Z_WINDOW, fill = NA, align = "right")
+  roll_sd    <- zoo::rollapply(y_raw, LEVEL_Z_WINDOW, sd, fill = NA, align = "right")
+  # Fill early NAs (first 126 bars) using expanding window mean/sd
+  for (i in which(is.na(roll_mean))) {
+    roll_mean[i] <- mean(y_raw[1:i], na.rm = TRUE)
+    roll_sd[i]   <- if (i > 1) sd(y_raw[1:i], na.rm = TRUE) else 0
   }
+  roll_sd    <- pmax(roll_sd, 1e-6)   # prevent division by zero
+  level_z_126 <- (y_raw - roll_mean) / roll_sd
+
+  cat("  Level z-score range:", round(min(level_z_126, na.rm=TRUE), 2),
+      "to", round(max(level_z_126, na.rm=TRUE), 2), "
+")
 
   # ── Build base table ──────────────────────────────────────────────────────
   n <- nrow(signals)
@@ -196,7 +216,7 @@ classify_regimes <- function(product = "CL",
     kf_mean       = kf$kf_mean,
     kf_z          = kf$kf_z,
     kf_slope      = kf$kf_slope,
-    ms_state_rank = ms$ms_state_rank,
+    level_z_126   = level_z_126,
     level_z       = ar$level_z
   )
 
@@ -254,25 +274,25 @@ classify_regimes <- function(product = "CL",
   cat("Assigning narrative regime labels...\n")
 
   # Work on explicit vectors to avoid data.table scoping issues in mapply
-  v_slope     <- ifelse(is.na(dt$kf_slope),       0,    dt$kf_slope)
-  v_ms_rank   <- ifelse(is.na(dt$ms_state_rank),  0.5,  dt$ms_state_rank)
+  v_slope     <- ifelse(is.na(dt$kf_slope),     0,   dt$kf_slope)
+  v_lz126     <- ifelse(is.na(dt$level_z_126),  0,   dt$level_z_126)
   v_near      <- dt$near_break
   v_dir       <- ifelse(is.na(dt$break_direction), "up", dt$break_direction)
 
   dt[, regime_label := mapply(
     .assign_label,
-    kalman_slope      = v_slope,
-    markov_state_rank = v_ms_rank,
-    near_break        = v_near,
-    break_direction   = v_dir
+    kalman_slope        = ifelse(is.na(kf_slope), 0, kf_slope),
+    markov_state_rank   = ifelse(is.na(ms_state_rank), 0.5, ms_state_rank),
+    near_break          = near_break,
+    break_direction     = ifelse(is.na(break_direction), "up", break_direction)
   )]
 
   # ── Override with z-score refinement ─────────────────────────────────────
   # If level_z is strongly positive/negative AND not near a break,
   # override ambiguous mid-tier labels for stronger signal
-  dt[near_break == FALSE & !is.na(level_z) & level_z > 2.0  & regime_label == "Stable-Elevated",
+  dt[!near_break & level_z > 2.0  & regime_label == "Stable-Elevated",
      regime_label := "Backwardation-Deficit"]
-  dt[near_break == FALSE & !is.na(level_z) & level_z < -2.0 & regime_label == "Stable-Depressed",
+  dt[!near_break & level_z < -2.0 & regime_label == "Stable-Depressed",
      regime_label := "Contango-Surplus"]
 
   # ── Diagnostic: print near_break breakdown per epoch ─────────────────────
@@ -310,6 +330,7 @@ classify_regimes <- function(product = "CL",
     days_to_next_break,
     kf_mean,
     kf_z,
+    level_z_126,
     level_z,
     M1M2
   )]
