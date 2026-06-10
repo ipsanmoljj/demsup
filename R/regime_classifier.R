@@ -253,21 +253,35 @@ classify_regimes <- function(product = "CL",
   # ── Assign regime label per bar ───────────────────────────────────────────
   cat("Assigning narrative regime labels...\n")
 
+  # Work on explicit vectors to avoid data.table scoping issues in mapply
+  v_slope     <- ifelse(is.na(dt$kf_slope),       0,    dt$kf_slope)
+  v_ms_rank   <- ifelse(is.na(dt$ms_state_rank),  0.5,  dt$ms_state_rank)
+  v_near      <- dt$near_break
+  v_dir       <- ifelse(is.na(dt$break_direction), "up", dt$break_direction)
+
   dt[, regime_label := mapply(
     .assign_label,
-    kalman_slope        = ifelse(is.na(kf_slope), 0, kf_slope),
-    markov_state_rank   = ifelse(is.na(ms_state_rank), 0.5, ms_state_rank),
-    near_break          = near_break,
-    break_direction     = ifelse(is.na(break_direction), "up", break_direction)
+    kalman_slope      = v_slope,
+    markov_state_rank = v_ms_rank,
+    near_break        = v_near,
+    break_direction   = v_dir
   )]
 
   # ── Override with z-score refinement ─────────────────────────────────────
   # If level_z is strongly positive/negative AND not near a break,
   # override ambiguous mid-tier labels for stronger signal
-  dt[!near_break & level_z > 2.0  & regime_label == "Stable-Elevated",
+  dt[near_break == FALSE & !is.na(level_z) & level_z > 2.0  & regime_label == "Stable-Elevated",
      regime_label := "Backwardation-Deficit"]
-  dt[!near_break & level_z < -2.0 & regime_label == "Stable-Depressed",
+  dt[near_break == FALSE & !is.na(level_z) & level_z < -2.0 & regime_label == "Stable-Depressed",
      regime_label := "Contango-Surplus"]
+
+  # ── Diagnostic: print near_break breakdown per epoch ─────────────────────
+  cat("\nNear-break diagnostic:\n")
+  print(dt[, .(
+    total_bars    = .N,
+    near_break_n  = sum(near_break),
+    near_break_pct = round(mean(near_break)*100,1)
+  ), by = epoch_id][order(epoch_id)])
 
   # ── Assign regime_id (integer epoch counter) ──────────────────────────────
   dt[, regime_id := .GRP, by = .(epoch_id)]
@@ -538,7 +552,8 @@ plot_regime_labels <- function(labels_result,
     ep_rows  <- out[regime_id == ep]
     if (nrow(ep_rows) == 0) next
 
-    ep_label <- ep_rows$regime_label[1]
+    # Use modal label (most frequent) not first bar — first bars may be Transition
+    ep_label <- names(sort(table(ep_rows$regime_label), decreasing = TRUE))[1]
     ep_col   <- label_colours[ep_label]
     if (is.na(ep_col)) ep_col <- "gray80"
 
@@ -615,7 +630,8 @@ plot_regime_labels <- function(labels_result,
   for (ep in unique_epochs) {
     ep_rows <- out[regime_id == ep]
     if (nrow(ep_rows) == 0) next
-    ep_label <- ep_rows$regime_label[1]
+    # Use modal label (most frequent) not first bar — first bars may be Transition
+    ep_label <- names(sort(table(ep_rows$regime_label), decreasing = TRUE))[1]
     ep_col   <- label_colours[ep_label]
     if (is.na(ep_col)) ep_col <- "gray70"
     ep_times <- as.POSIXct(ep_rows$date)
