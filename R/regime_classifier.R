@@ -42,32 +42,48 @@ library(zoo)
 #   2. Markov state   — which state the bar belongs to (ranked by mean level)
 #   3. Level z-score  — how far the current level is from its rolling mean
 #
-# Label taxonomy (six labels):
+# Label taxonomy (nine labels):
 #
-#   Backwardation-Deficit   : Kalman rising  + Markov high state
-#   Stable-Elevated         : Kalman flat    + Markov high state
-#   Contango-Surplus        : Kalman falling + Markov low state
-#   Stable-Depressed        : Kalman flat    + Markov low state
-#   Transition-Tightening   : Within ±TRANSITION_WINDOW bars of a break, direction up
-#   Transition-Loosening    : Within ±TRANSITION_WINDOW bars of a break, direction down
+# Two dimensions combined:
+#   1. M1M2 sign — physical direction (absolute, never overridden)
+#        M1M2 > 0 = backwardation family
+#        M1M2 < 0 = contango family
+#   2. Z-score + slope — intensity and trend within that direction
 #
-# Transition labels override the directional labels when a bar is close to a
-# confirmed break date. This prevents the classifier from confidently labelling
-# a period that is structurally changing.
+#   Deep-Backwardation    : M1M2 > 0, z > deep_high          → crisis-level squeeze
+#   Backwardation-Deficit : M1M2 > 0, z > high, slope rising  → active tightening
+#   Easing-Backwardation  : M1M2 > 0, z < low,  slope falling → still tight, loosening
+#   Stable-Elevated       : M1M2 > 0, z mid or flat slope     → tight, stable plateau
+#   Stable-Depressed      : M1M2 < 0, z mid or flat slope     → loose, stable floor
+#   Easing-Contango       : M1M2 < 0, z > high, slope rising  → still loose, tightening
+#   Contango-Surplus      : M1M2 < 0, z < low,  slope falling → active loosening
+#   Deep-Contango         : M1M2 < 0, z < deep_low            → crisis-level oversupply
+#   Transition-Tightening : near break, direction up
+#   Transition-Loosening  : near break, direction down
+#
+# Thresholds derived empirically per product via BIC (select_thresholds()).
 
 TRANSITION_WINDOW    <- 5    # bars either side of a break date = transition zone
 KALMAN_SLOPE_WINDOW  <- 10   # bars to compute Kalman slope over
 KALMAN_SLOPE_THRESH  <- 0.05 # minimum slope magnitude to count as rising/falling
-LEVEL_Z_WINDOW       <- 126  # 6-month rolling window for level z-score (scale-independent)
-LEVEL_Z_HIGH_THRESH  <-  0.5 # above this z-score = "high tier" (above 6-month norm)
-LEVEL_Z_LOW_THRESH   <- -0.5 # below this z-score = "low tier"  (below 6-month norm)
+LEVEL_Z_WINDOW       <- 126  # fallback window if window_selector not sourced
+LEVEL_Z_HIGH_THRESH  <-  0.5 # fallback high threshold
+LEVEL_Z_LOW_THRESH   <- -0.5 # fallback low threshold
+LEVEL_Z_DEEP_HIGH    <-  1.5 # fallback deep-high threshold
+LEVEL_Z_DEEP_LOW     <- -1.5 # fallback deep-low threshold
+LOOKBACK_LAG         <-  63  # fallback lag: baseline excludes most recent N bars
 
 # ── Assign narrative label to a single bar ────────────────────────────────────
 
 .assign_label <- function(kalman_slope,
-                           level_z_126,         # 6-month rolling z-score of M1M2 (scale-independent)
+                           level_z_126,         # rolling z-score of M1M2 (scale-independent)
+                           m1m2,                # raw M1M2 value (determines physical direction)
                            near_break,          # logical: within transition window
-                           break_direction) {   # "up" or "down" if near_break
+                           break_direction,     # "up" or "down" if near_break
+                           z_high   = LEVEL_Z_HIGH_THRESH,
+                           z_low    = LEVEL_Z_LOW_THRESH,
+                           z_deep_h = LEVEL_Z_DEEP_HIGH,
+                           z_deep_l = LEVEL_Z_DEEP_LOW) {
 
   if (near_break) {
     return(ifelse(break_direction == "up",
@@ -75,29 +91,45 @@ LEVEL_Z_LOW_THRESH   <- -0.5 # below this z-score = "low tier"  (below 6-month n
                   "Transition-Loosening"))
   }
 
-  # Determine level tier from 6-month rolling z-score
-  # This is scale-independent: works for CL ($/bbl), LGO ($/mt), HO ($/gallon)
-  # "high" = M1M2 above its own 6-month average → market tighter than recent norm
-  # "low"  = M1M2 below its own 6-month average → market looser than recent norm
-  level_tier <- ifelse(level_z_126 >= LEVEL_Z_HIGH_THRESH, "high",
-                ifelse(level_z_126 <= LEVEL_Z_LOW_THRESH,  "low", "mid"))
+  # Dimension 1: physical direction from M1M2 sign (absolute, never overridden)
+  is_backwardated <- m1m2 >= 0   # front month premium = backwardation
 
-  # Combine slope + level tier → narrative label
+  # Dimension 2: intensity tier from z-score
+  level_tier <- ifelse(level_z_126 >= z_deep_h, "deep_high",
+                ifelse(level_z_126 >= z_high,    "high",
+                ifelse(level_z_126 <= z_deep_l,  "deep_low",
+                ifelse(level_z_126 <= z_low,      "low", "mid"))))
+
+  # Combine: direction + intensity + slope → label
   #
-  # Rising slope + high/mid level  = actively tightening market
-  # Falling slope + low/mid level  = actively loosening market
-  # Flat slope + high level        = tight but stable (plateau)
-  # Flat slope + low level         = loose but stable (floor)
-  # Flat slope + mid level         = balanced market
-  if (kalman_slope > KALMAN_SLOPE_THRESH  && level_tier != "low")  return("Backwardation-Deficit")
-  if (kalman_slope > KALMAN_SLOPE_THRESH  && level_tier == "low")  return("Stable-Depressed")
-  if (kalman_slope < -KALMAN_SLOPE_THRESH && level_tier != "high") return("Contango-Surplus")
-  if (kalman_slope < -KALMAN_SLOPE_THRESH && level_tier == "high") return("Stable-Elevated")
-  if (level_tier == "high")                                         return("Stable-Elevated")
-  if (level_tier == "low")                                          return("Stable-Depressed")
+  # Logic:
+  #   Deep tier    → always gets deep label regardless of slope
+  #   High tier    → Backwardation-Deficit if slope rising OR flat (sustained tight)
+  #                  Easing-Backwardation  if slope falling (tightness unwinding)
+  #   Low tier     → Easing-Backwardation  if still positive M1M2 (coming off a high)
+  #   Mid tier     → Stable-Elevated (balanced within backwardation)
+  #
+  # Same logic mirrored for contango family.
 
-  # Mid tier, flat slope → balanced market, use slight slope bias
-  ifelse(kalman_slope >= 0, "Stable-Elevated", "Stable-Depressed")
+  # Backwardation family (M1M2 >= 0)
+  if (is_backwardated) {
+    if (level_tier == "deep_high")                               return("Deep-Backwardation")
+    if (level_tier == "high" && kalman_slope >= -KALMAN_SLOPE_THRESH) return("Backwardation-Deficit")
+    if (level_tier == "high" && kalman_slope <  -KALMAN_SLOPE_THRESH) return("Easing-Backwardation")
+    if (level_tier == "low"  || level_tier == "deep_low")        return("Easing-Backwardation")
+    return("Stable-Elevated")   # mid tier
+  }
+
+  # Contango family (M1M2 < 0)
+  if (!is_backwardated) {
+    if (level_tier == "deep_low")                                return("Deep-Contango")
+    if (level_tier == "low"  && kalman_slope <= KALMAN_SLOPE_THRESH) return("Contango-Surplus")
+    if (level_tier == "low"  && kalman_slope >  KALMAN_SLOPE_THRESH) return("Easing-Contango")
+    if (level_tier == "high" || level_tier == "deep_high")       return("Easing-Contango")
+    return("Stable-Depressed")  # mid tier
+  }
+
+  "Stable-Elevated"  # fallback
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -152,8 +184,15 @@ LEVEL_Z_LOW_THRESH   <- -0.5 # below this z-score = "low tier"  (below 6-month n
 # SECTION 3 — PER-PRODUCT CLASSIFIER
 # ═════════════════════════════════════════════════════════════════════════════
 
-classify_regimes <- function(product = "CL",
-                              output_dir = "output") {
+classify_regimes <- function(product        = "CL",
+                              output_dir     = "output",
+                              level_z_window = NULL,
+                              lookback_lag   = NULL) {
+  # level_z_window: override the rolling window for level z-score.
+  #   If NULL (default), auto-selects using BIC via select_level_z_window().
+  # lookback_lag: bars to exclude before the window starts (pre-crisis baseline).
+  #   If NULL (default), auto-selects using BIC via select_level_z_window().
+  #   Ensures z-score measures deviation from pre-current-regime levels.
 
   cat("\n", strrep("=", 60), "\n")
   cat("REGIME CLASSIFIER —", product, "\n")
@@ -188,24 +227,133 @@ classify_regimes <- function(product = "CL",
   kf[, kf_slope := c(rep(NA, KALMAN_SLOPE_WINDOW),
                       diff(kf_mean, lag = KALMAN_SLOPE_WINDOW))]
 
-  # ── Compute 126-day rolling z-score of M1M2 (scale-independent level tier) ──
-  # This replaces Markov state rank as the level indicator.
-  # Uses the raw M1M2 series directly — no unit assumptions.
-  # A z-score > +0.5 means "above 6-month norm" regardless of product units.
-  y_raw      <- signals$M1M2
-  roll_mean  <- zoo::rollmean(y_raw, LEVEL_Z_WINDOW, fill = NA, align = "right")
-  roll_sd    <- zoo::rollapply(y_raw, LEVEL_Z_WINDOW, sd, fill = NA, align = "right")
-  # Fill early NAs (first 126 bars) using expanding window mean/sd
-  for (i in which(is.na(roll_mean))) {
-    roll_mean[i] <- mean(y_raw[1:i], na.rm = TRUE)
-    roll_sd[i]   <- if (i > 1) sd(y_raw[1:i], na.rm = TRUE) else 0
+  # ── Auto-select or use provided rolling window for level z-score ────────
+  # Window selection uses BIC via window_selector.R (must be sourced first).
+  # If level_z_window is provided directly, that value is used instead.
+  y_raw <- signals$M1M2
+
+  if (is.null(level_z_window)) {
+    # Check if select_level_z_window() is available
+    if (exists("select_level_z_window", mode = "function")) {
+      cat("  Auto-selecting level z-score window via BIC...\n")
+      window_result  <- select_level_z_window(
+        product    = product,
+        output_dir = output_dir,
+        windows    = CANDIDATE_WINDOWS_EXTENDED,
+        plot       = FALSE   # suppress plot during classification
+      )
+      chosen_window <- window_result$optimal_window
+      cat("  Selected window:", chosen_window, "days (",
+          round(chosen_window / 21, 1), "months ) —",
+          window_result$selection_method, "\n")
+    } else {
+      # Fallback if window_selector.R not sourced
+      chosen_window <- LEVEL_Z_WINDOW
+      cat("  window_selector.R not sourced — using default LEVEL_Z_WINDOW:",
+          chosen_window, "days\n")
+      cat("  Tip: source('R/window_selector.R') before classify_regimes()\n")
+    }
+  } else {
+    chosen_window <- level_z_window
+    cat("  Using provided level_z_window:", chosen_window, "days\n")
   }
-  roll_sd    <- pmax(roll_sd, 1e-6)   # prevent division by zero
+
+  # ── Auto-select or use provided lookback lag ─────────────────────────────
+  if (is.null(lookback_lag)) {
+    if (exists("select_level_z_window", mode = "function")) {
+      cat("  Auto-selecting lookback lag via BIC...\n")
+      lag_result   <- select_lookback_lag(
+        product    = product,
+        output_dir = output_dir,
+        window     = chosen_window,
+        plot       = FALSE
+      )
+      chosen_lag <- lag_result$optimal_lag
+      cat("  Selected lag:", chosen_lag, "days (", round(chosen_lag/21,1),
+          "months ) —", lag_result$selection_method, "\n")
+    } else {
+      chosen_lag <- LOOKBACK_LAG
+      cat("  Using default LOOKBACK_LAG:", chosen_lag, "days\n")
+    }
+  } else {
+    chosen_lag <- lookback_lag
+    cat("  Using provided lookback_lag:", chosen_lag, "days\n")
+  }
+
+  # ── Compute lagged rolling z-score (pre-crisis baseline) ─────────────────
+  # Baseline window: from (t - chosen_window - chosen_lag) to (t - chosen_lag)
+  # This means the reference is always computed from BEFORE the current period,
+  # so a sustained crisis doesn't inflate the baseline mean.
+  n_raw <- length(y_raw)
+
+  # Vectorised lagged rolling statistics using zoo
+  # Lag the series by chosen_lag positions, then apply standard rolling window
+  # This is equivalent to: baseline_mean[t] = mean(y[t-lag-window+1 : t-lag])
+  if (chosen_lag == 0) {
+    # No lag: standard rolling window
+    roll_mean <- as.numeric(zoo::rollmean(y_raw, chosen_window, fill = NA, align = "right"))
+    roll_sd   <- as.numeric(zoo::rollapply(y_raw, chosen_window, sd, fill = NA, align = "right"))
+  } else {
+    # Lagged baseline: shift series forward by lag, then compute rolling stats
+    y_lagged  <- c(rep(NA_real_, chosen_lag), y_raw[1:(n_raw - chosen_lag)])
+    roll_mean <- as.numeric(zoo::rollmean(y_lagged, chosen_window, fill = NA, align = "right"))
+    roll_sd   <- as.numeric(zoo::rollapply(y_lagged, chosen_window, sd, fill = NA, align = "right"))
+  }
+
+  # ── Warm-up period exclusion ─────────────────────────────────────────────
+  # Bars before (chosen_window + chosen_lag) have no valid pre-lag baseline.
+  # Comparing them against future data would introduce look-ahead bias.
+  # These bars are marked as warm-up and excluded from regime label assignment.
+  warmup_bars <- chosen_window + chosen_lag
+  warmup_mask <- seq_len(n_raw) <= warmup_bars
+
+  cat("  Warm-up period:", warmup_bars, "bars —",
+      sum(warmup_mask), "bars excluded from classification\n")
+
+  # For bars outside warm-up: fill any remaining NAs with nearest valid value
+  # (should be rare — only affects edge cases at boundary)
+  if (any(is.na(roll_mean) & !warmup_mask)) {
+    last_valid_mean <- mean(y_raw[1:warmup_bars], na.rm = TRUE)
+    last_valid_sd   <- sd(y_raw[1:warmup_bars],   na.rm = TRUE)
+    for (i in which(is.na(roll_mean) & !warmup_mask)) {
+      roll_mean[i] <- last_valid_mean
+      roll_sd[i]   <- last_valid_sd
+    }
+  }
+
+  # Floor sd to prevent division issues (use 1% of post-warmup sd)
+  post_warmup_sd <- sd(y_raw[!warmup_mask], na.rm = TRUE)
+  roll_sd <- pmax(roll_sd, post_warmup_sd * 0.01, na.rm = TRUE)
   level_z_126 <- (y_raw - roll_mean) / roll_sd
 
   cat("  Level z-score range:", round(min(level_z_126, na.rm=TRUE), 2),
-      "to", round(max(level_z_126, na.rm=TRUE), 2), "
-")
+      "to", round(max(level_z_126, na.rm=TRUE), 2),
+      "| Lag:", chosen_lag, "days | Window:", chosen_window, "days\n")
+
+  # ── Auto-select or use provided threshold values ──────────────────────────
+  if (exists("select_thresholds", mode = "function")) {
+    cat("  Auto-selecting z-score thresholds via BIC...\n")
+    thresh_result <- select_thresholds(
+      product    = product,
+      output_dir = output_dir,
+      window     = chosen_window,
+      plot       = FALSE
+    )
+    z_high   <- thresh_result$z_high
+    z_low    <- thresh_result$z_low
+    z_deep_h <- thresh_result$z_deep_high
+    z_deep_l <- thresh_result$z_deep_low
+    cat("  Thresholds — Deep-Back:", z_deep_h,
+        "| Back:", z_high,
+        "| Cont:", z_low,
+        "| Deep-Cont:", z_deep_l, "\n")
+  } else {
+    z_high   <- LEVEL_Z_HIGH_THRESH
+    z_low    <- LEVEL_Z_LOW_THRESH
+    z_deep_h <- LEVEL_Z_DEEP_HIGH
+    z_deep_l <- LEVEL_Z_DEEP_LOW
+    cat("  Using fallback thresholds (source window_selector.R for auto-selection)\n")
+  }
 
   # ── Build base table ──────────────────────────────────────────────────────
   n <- nrow(signals)
@@ -273,19 +421,31 @@ classify_regimes <- function(product = "CL",
   # ── Assign regime label per bar ───────────────────────────────────────────
   cat("Assigning narrative regime labels...\n")
 
+  # Mark warm-up bars — these have no valid pre-lag baseline
+  dt[, in_warmup := warmup_mask]
+
   # Work on explicit vectors to avoid data.table scoping issues in mapply
   v_slope     <- ifelse(is.na(dt$kf_slope),     0,   dt$kf_slope)
   v_lz126     <- ifelse(is.na(dt$level_z_126),  0,   dt$level_z_126)
+  v_m1m2      <- dt$M1M2
   v_near      <- dt$near_break
   v_dir       <- ifelse(is.na(dt$break_direction), "up", dt$break_direction)
 
   dt[, regime_label := mapply(
     .assign_label,
-    kalman_slope  = v_slope,
-    level_z_126   = v_lz126,
-    near_break    = v_near,
-    break_direction = v_dir
+    kalman_slope    = v_slope,
+    level_z_126     = v_lz126,
+    m1m2            = v_m1m2,
+    near_break      = v_near,
+    break_direction = v_dir,
+    z_high          = z_high,
+    z_low           = z_low,
+    z_deep_h        = z_deep_h,
+    z_deep_l        = z_deep_l
   )]
+
+  # Override warm-up bars — exclude from regime classification
+  dt[in_warmup == TRUE, regime_label := "Warm-Up"]
 
   # ── Override with z-score refinement ─────────────────────────────────────
   # If level_z_126 is extreme AND not near a break, upgrade label strength
@@ -293,6 +453,9 @@ classify_regimes <- function(product = "CL",
      regime_label := "Backwardation-Deficit"]
   dt[near_break == FALSE & !is.na(level_z_126) & level_z_126 < -2.0 & regime_label == "Stable-Depressed",
      regime_label := "Contango-Surplus"]
+
+  # Physical direction is now baked into .assign_label() directly via m1m2 sign
+  # No post-hoc override needed
 
   # ── Diagnostic: print near_break breakdown per epoch ─────────────────────
   cat("\nNear-break diagnostic:\n")
@@ -323,6 +486,7 @@ classify_regimes <- function(product = "CL",
     product,
     regime_label,
     regime_id,
+    in_warmup,
     confidence_score,
     confidence_band,
     days_since_break,
@@ -333,27 +497,34 @@ classify_regimes <- function(product = "CL",
     level_z,
     M1M2
   )]
+  out[, level_z_window := chosen_window]
+  out[, lookback_lag   := chosen_lag]
 
   # ── Save ──────────────────────────────────────────────────────────────────
   out_path <- file.path(output_dir, paste0("regime_labels_", product, ".csv"))
   fwrite(out, out_path)
   cat("Saved:", out_path, "\n")
 
-  # ── Summary table ─────────────────────────────────────────────────────────
-  summary_tbl <- out[, .(
+  # ── Summary table (excludes warm-up bars) ────────────────────────────────
+  n_active    <- nrow(out[regime_label != "Warm-Up"])
+  summary_tbl <- out[regime_label != "Warm-Up", .(
     n_bars       = .N,
-    pct_of_total = round(.N / nrow(out) * 100, 1),
+    pct_of_total = round(.N / n_active * 100, 1),
     mean_conf    = round(mean(confidence_score), 3),
     mean_M1M2    = round(mean(M1M2, na.rm = TRUE), 3)
   ), by = regime_label][order(-n_bars)]
+
+  cat("  Active bars (post warm-up):", n_active, "of", nrow(out), "total\n")
 
   cat("\n--- REGIME SUMMARY:", product, "---\n\n")
   print(summary_tbl)
 
   list(
-    labels  = out,
-    summary = summary_tbl,
-    product = product
+    labels          = out,
+    summary         = summary_tbl,
+    product         = product,
+    level_z_window  = chosen_window,
+    lookback_lag    = chosen_lag
   )
 }
 
@@ -520,33 +691,47 @@ plot_regime_labels <- function(labels_result,
     save_path <- paste0("output/regime_labels_", product, "_plot_v3.png")
   }
 
-  # Colour map for narrative labels
+  # Colour map for narrative labels (11 labels including Warm-Up)
   label_colours <- c(
+    "Warm-Up"                = "#DDDDDD",   # light grey — excluded warm-up period
+    "Deep-Backwardation"     = "#7B0000",   # dark crimson
     "Backwardation-Deficit"  = "#C0392B",   # deep red
+    "Easing-Backwardation"   = "#E8927C",   # salmon — still tight but loosening
     "Stable-Elevated"        = "#E67E22",   # amber
     "Transition-Tightening"  = "#F39C12",   # yellow-orange
     "Transition-Loosening"   = "#2980B9",   # mid blue
     "Stable-Depressed"       = "#1ABC9C",   # teal
-    "Contango-Surplus"       = "#2C3E50"    # dark navy
+    "Easing-Contango"        = "#76B7A0",   # light teal — still loose but tightening
+    "Contango-Surplus"       = "#2C3E50",   # dark navy
+    "Deep-Contango"          = "#0A0A2E"    # near black navy
   )
 
-  # Two-line label text — rendered as two separate text() calls
-  # (base R does not support \n in text(); stacking done via y offset)
+  # Two-line label text
   label_line1 <- c(
+    "Warm-Up"                = "WARM",
+    "Deep-Backwardation"     = "DEEP",
     "Backwardation-Deficit"  = "BACK-",
+    "Easing-Backwardation"   = "EASING",
     "Stable-Elevated"        = "STABLE",
     "Transition-Tightening"  = "TRANS",
     "Transition-Loosening"   = "TRANS",
     "Stable-Depressed"       = "STABLE",
-    "Contango-Surplus"       = "CONT-"
+    "Easing-Contango"        = "EASING",
+    "Contango-Surplus"       = "CONT-",
+    "Deep-Contango"          = "DEEP"
   )
   label_line2 <- c(
+    "Warm-Up"                = "UP",
+    "Deep-Backwardation"     = "BACKW.",
     "Backwardation-Deficit"  = "DEFICIT",
+    "Easing-Backwardation"   = "BACK.",
     "Stable-Elevated"        = "HIGH",
     "Transition-Tightening"  = "TIGHTEN",
     "Transition-Loosening"   = "LOOSEN",
     "Stable-Depressed"       = "LOW",
-    "Contango-Surplus"       = "SURPLUS"
+    "Easing-Contango"        = "CONT.",
+    "Contango-Surplus"       = "SURPLUS",
+    "Deep-Contango"          = "CONTANGO"
   )
 
   png(save_path, width = 1800, height = 1100, res = 120)
