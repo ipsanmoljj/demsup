@@ -281,18 +281,17 @@ classify_regimes <- function(product = "CL",
 
   dt[, regime_label := mapply(
     .assign_label,
-    kalman_slope        = ifelse(is.na(kf_slope), 0, kf_slope),
-    markov_state_rank   = ifelse(is.na(ms_state_rank), 0.5, ms_state_rank),
-    near_break          = near_break,
-    break_direction     = ifelse(is.na(break_direction), "up", break_direction)
+    kalman_slope  = v_slope,
+    level_z_126   = v_lz126,
+    near_break    = v_near,
+    break_direction = v_dir
   )]
 
   # ── Override with z-score refinement ─────────────────────────────────────
-  # If level_z is strongly positive/negative AND not near a break,
-  # override ambiguous mid-tier labels for stronger signal
-  dt[!near_break & level_z > 2.0  & regime_label == "Stable-Elevated",
+  # If level_z_126 is extreme AND not near a break, upgrade label strength
+  dt[near_break == FALSE & !is.na(level_z_126) & level_z_126 > 2.0 & regime_label == "Stable-Elevated",
      regime_label := "Backwardation-Deficit"]
-  dt[!near_break & level_z < -2.0 & regime_label == "Stable-Depressed",
+  dt[near_break == FALSE & !is.na(level_z_126) & level_z_126 < -2.0 & regime_label == "Stable-Depressed",
      regime_label := "Contango-Surplus"]
 
   # ── Diagnostic: print near_break breakdown per epoch ─────────────────────
