@@ -150,17 +150,36 @@ run_parallel_models <- function(data,
 .run_markov <- function(y, dates, n_states = 3) {
   library(MSwM)
 
-  ms_dt <- data.frame(y = y, t = seq_along(y))
+  # ── Normalise y before fitting ───────────────────────────────────────────
+  # MSwM numerical optimisation is sensitive to scale.
+  # LGO ($/mt range -70 to +170) and LCO cause singular covariance matrices
+  # when passed raw. Standardise to mean=0, sd=1 before fitting, then
+  # rescale state means back to original units for interpretability.
+  y_mean <- mean(y, na.rm = TRUE)
+  y_sd   <- sd(y,   na.rm = TRUE)
+  if (is.na(y_sd) || y_sd < 1e-8) y_sd <- 1
+  y_scaled <- (y - y_mean) / y_sd
 
-  ms_fit <- tryCatch({
-    # Fit Markov switching model with switching mean and variance
-    lm_base <- lm(y ~ 1, data = ms_dt)
-    msmFit(lm_base, k = n_states, sw = c(TRUE, TRUE),
-           control = list(parallel = FALSE, maxiter = 500, tol = 1e-6))
-  }, error = function(e) {
-    cat("  MS: fit failed —", conditionMessage(e), "\n")
-    NULL
-  })
+  ms_dt <- data.frame(y = y_scaled, t = seq_along(y_scaled))
+
+  # Try requested n_states first, fall back to k=2 if singular
+  ms_fit <- NULL
+  for (k_try in unique(c(n_states, 2L))) {
+    ms_fit <- tryCatch({
+      lm_base <- lm(y_scaled ~ 1, data = ms_dt)
+      msmFit(lm_base, k = k_try, sw = c(TRUE, TRUE),
+             control = list(parallel = FALSE, maxiter = 500, tol = 1e-6))
+    }, error = function(e) {
+      cat("  MS: k=", k_try, "failed —", conditionMessage(e), "\n")
+      NULL
+    })
+    if (!is.null(ms_fit)) {
+      if (k_try != n_states)
+        cat("  MS: fell back to k=", k_try, "states\n")
+      n_states <- k_try
+      break
+    }
+  }
 
   if (is.null(ms_fit)) {
     return(data.table(date = dates,
@@ -176,7 +195,8 @@ run_parallel_models <- function(data,
   states    <- apply(probs, 1, which.max)
 
   # Label states by their mean (lowest mean = contango, highest = backwardation)
-  state_means <- ms_fit@Coef[, "(Intercept)"]
+  # Rescale state means back to original units
+  state_means <- ms_fit@Coef[, "(Intercept)"] * y_sd + y_mean
   state_order <- order(state_means)
   labels      <- character(n_states)
   if (n_states == 2) {
