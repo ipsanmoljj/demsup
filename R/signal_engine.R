@@ -268,10 +268,22 @@ run_signal_engine <- function(products   = c("CL","LCO","HO","LGO"),
     cfg    <- PRODUCT_CONFIG[[prod]]
     thresh <- SIGNAL_THRESHOLDS[prod]
 
-    labels_path <- file.path(output_dir,
-                              paste0("regime_labels_", prod, ".csv"))
+    # classify_regimes() (regime_classifier.R) now defaults to writing
+    # regime_labels_<product>.csv under output/<product>/ rather than
+    # directly under output/ — fixed 2026-06-17 alongside the cross-product
+    # model-file collision bug (see regime_classifier.R's classify_regimes
+    # docstring). Check the new per-product path first; fall back to the old
+    # shared-output path for anyone running this against pre-fix CSVs that
+    # haven't been regenerated yet, so this doesn't silently SKIP a product
+    # just because the directory convention moved.
+    labels_path_new <- file.path(output_dir, prod,
+                                  paste0("regime_labels_", prod, ".csv"))
+    labels_path_old <- file.path(output_dir,
+                                  paste0("regime_labels_", prod, ".csv"))
+    labels_path <- if (file.exists(labels_path_new)) labels_path_new else labels_path_old
+
     if (!file.exists(labels_path)) {
-      cat("  SKIP: regime labels not found\n\n"); next
+      cat("  SKIP: regime labels not found (checked", labels_path_new, "and", labels_path_old, ")\n\n"); next
     }
 
     dt <- fread(labels_path)
@@ -416,6 +428,7 @@ run_signal_engine <- function(products   = c("CL","LCO","HO","LGO"),
 
     # ── Live signal ─────────────────────────────────────────────────────────
     last <- tail(dt[!in_warmup & !is.na(level_z_126)], 1)
+    live_signal <- NULL
     if (nrow(last) > 0) {
       cat(sprintf("  LIVE SIGNAL (%s):\n", format(last$date)))
       cat(sprintf("    Regime:    %s\n",      last$regime_label))
@@ -426,6 +439,24 @@ run_signal_engine <- function(products   = c("CL","LCO","HO","LGO"),
       cat(sprintf("    Vol gate:  %s\n",
                   ifelse(last$atr_filter_pass,"PASS","BLOCKED")))
       sig <- last$signal
+      # Structured version of the same live-signal block, returned to the
+      # caller (e.g. plumber's /signal endpoint) instead of only printed —
+      # this guarantees a served "live signal" is always identical to what
+      # this validated function itself computed, with no separate
+      # reimplementation of the gating logic anywhere else.
+      live_signal <- list(
+        product          = prod,
+        date             = as.character(last$date),
+        regime           = last$regime_label,
+        m1m2             = round(last$M1M2, 4),
+        level_z          = round(last$level_z_126, 3),
+        atr14            = if (is.na(last$atr14)) NA else round(last$atr14, 4),
+        vol_gate_pass    = isTRUE(last$atr_filter_pass),
+        vol_gate         = atr_gate,
+        threshold        = thresh,
+        signal           = sig,
+        unit             = cfg$unit
+      )
       if (sig != "FLAT") {
         stop_dist <- last$atr14 * cfg$atr_multiplier
         hard_stop <- last$M1M2 - ifelse(sig=="BUY",1,-1) * stop_dist
@@ -433,10 +464,16 @@ run_signal_engine <- function(products   = c("CL","LCO","HO","LGO"),
         cat(sprintf("    Stop:      %.4f %s (%.1fx ATR)\n",
                     stop_dist, cfg$unit, cfg$atr_multiplier))
         cat(sprintf("    Hard stop: %.4f %s\n", hard_stop, cfg$unit))
+        live_signal$stop_dist <- round(stop_dist, 4)
+        live_signal$hard_stop <- round(hard_stop, 4)
+        live_signal$atr_multiplier <- cfg$atr_multiplier
       } else {
         cat(sprintf("    Signal:    FLAT  (z=%+.3f  thresh=%.2f  gate=%s)\n",
                     last$level_z_126, thresh,
                     ifelse(last$atr_filter_pass,"pass","blocked")))
+        live_signal$stop_dist <- NA
+        live_signal$hard_stop <- NA
+        live_signal$atr_multiplier <- cfg$atr_multiplier
       }
       cat("\n")
     }
@@ -465,7 +502,7 @@ run_signal_engine <- function(products   = c("CL","LCO","HO","LGO"),
       )
     }
 
-    all_results[[prod]] <- list(trades=trades_dt, config=cfg, thresh=thresh)
+    all_results[[prod]] <- list(trades=trades_dt, config=cfg, thresh=thresh, live_signal=live_signal)
   }
 
   # ── Cross-product summary ──────────────────────────────────────────────────

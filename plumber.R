@@ -51,6 +51,7 @@ source("R/regime_models.R")
 source("R/regime_models_treated.R")
 source("R/window_selector.R")
 source("R/regime_classifier.R")
+source("R/signal_engine.R")
 
 VALID_PRODUCTS <- c("CL", "LCO", "HO", "LGO")
 OUTPUT_BASE    <- "output"
@@ -215,9 +216,224 @@ function(res) {
   )
 }
 
+#* Return the FULL daily regime history for one product — date, regime_label,
+#* level_z_126, confidence_score, M1M2, for every non-warmup day. Used for
+#* historical regime timeline / z-score charting on the dashboard, as opposed
+#* to /regime which only returns the latest row.
+#* @param product:character One of CL, LCO, HO, LGO
+#* @serializer unboxedJSON
+#* @get /regime-history
+function(product = "", res) {
+  product <- toupper(trimws(product))
+
+  if (!(product %in% VALID_PRODUCTS)) {
+    res$status <- 400
+    return(list(
+      error = paste0(
+        "Unknown product '", product, "'. Valid: ",
+        paste(VALID_PRODUCTS, collapse = ", ")
+      )
+    ))
+  }
+
+  cached <- .get_cached()
+  if (product %in% names(cached$errors)) {
+    res$status <- 503
+    return(list(error = cached$errors[[product]]))
+  }
+  result <- cached$per_product[[product]]
+  if (is.null(result) || is.null(result$labels)) {
+    res$status <- 503
+    return(list(error = paste0("no classification result available for '", product, "'")))
+  }
+
+  labels <- result$labels[in_warmup == FALSE]
+  if (nrow(labels) == 0) {
+    res$status <- 503
+    return(list(error = paste0("'", product, "' has no non-warmup history yet")))
+  }
+  setorder(labels, date)
+
+  list(
+    product = product,
+    history = lapply(seq_len(nrow(labels)), function(i) {
+      row <- labels[i]
+      list(
+        date              = as.character(row$date),
+        regime_label      = row$regime_label,
+        regime_id         = row$regime_id,
+        level_z_126       = if (is.na(row$level_z_126)) NA else round(row$level_z_126, 4),
+        confidence_score  = if (is.na(row$confidence_score)) NA else round(row$confidence_score, 4),
+        m1m2              = round(row$M1M2, 4)
+      )
+    })
+  )
+}
+
+#* TEMPORARY DEBUG — confirms whether window_selector.R's functions are
+#* actually loaded in plumber's live execution environment, vs. just present
+#* in the plumber.R source file. Added 2026-06-18 to diagnose why
+#* classify_regimes() keeps falling back to default window/lag even after
+#* restarts. Safe to remove once the root cause is found.
+#* @serializer unboxedJSON
+#* @get /debug/env-check
+function() {
+  # Actually call classify_regimes() right now, fresh (bypassing the 30-min
+  # cache entirely), and report what window/lag it actually chose — this is
+  # the only way to know for certain which code path it took, since every
+  # exists() check has passed and yet the cached /regime-history results
+  # still show fallback-like behavior (high segment counts). If this field
+  # shows level_z_window != 126, the live call IS auto-selecting correctly
+  # and the problem must be in something else (e.g. the cache holding an
+  # old pre-fix result). If it still shows 126, the bug is inside
+  # classify_regimes() itself or how it's being invoked here, despite every
+  # exists() check passing.
+  live_call_result <- tryCatch({
+    r <- classify_regimes(product = "CL", output_dir = file.path(OUTPUT_BASE, "CL"))
+    list(
+      level_z_window_used = r$level_z_window,
+      lookback_lag_used   = r$lookback_lag,
+      n_unique_regimes_in_labels = length(unique(r$labels$regime_label)),
+      first_few_regime_labels    = head(r$labels[in_warmup == FALSE]$regime_label, 10)
+    )
+  }, error = function(e) list(error = conditionMessage(e)))
+
+  list(
+    select_level_z_window_exists = exists("select_level_z_window", mode = "function"),
+    select_lookback_lag_exists   = exists("select_lookback_lag",   mode = "function"),
+    select_thresholds_exists     = exists("select_thresholds",     mode = "function"),
+    classify_regimes_env_is_global = identical(environment(classify_regimes), globalenv()),
+    working_directory             = getwd(),
+    window_selector_file_exists   = file.exists("R/window_selector.R"),
+    window_selector_file_mtime    = if (file.exists("R/window_selector.R")) as.character(file.info("R/window_selector.R")$mtime) else NA,
+    all_global_functions_matching_select = ls(envir = globalenv())[grepl("^select_", ls(envir = globalenv()))],
+    live_call_result = live_call_result
+  )
+}
+
 #* Health check
 #* @serializer unboxedJSON
 #* @get /health
 function() {
   list(status = "ok", products = VALID_PRODUCTS)
+}
+
+# ═════════════════════════════════════════════════════════════════════════
+# SIGNAL ENGINE — Layer A daily trade signal (R/signal_engine.R)
+# ═════════════════════════════════════════════════════════════════════════
+#
+# run_signal_engine() depends on output/<product>/regime_labels_<product>.csv
+# (with a fallback to the old shared output/regime_labels_<product>.csv —
+# see signal_engine.R's labels_path fix, 2026-06-18). That file is written by
+# classify_regimes() — so run /refresh (or call classify_regimes() yourself)
+# before expecting fresh signal_engine results to reflect a new regime fit.
+#
+# run_signal_engine() is itself the validated function — this cache just
+# avoids re-running it (and its full historical trade simulation across all
+# four products) on every single HTTP request. It returns:
+#   $live_signal[[product]] -> today's signal (BUY/SELL/FLAT) + why
+#   $summary                -> data.table from signal_summary.csv-equivalent
+#                               test-window stats (hit rate, EV, P&L, etc.)
+
+.signal_cache <- new.env()
+.signal_cache$data      <- NULL
+.signal_cache$cached_at <- as.POSIXct(0)
+.signal_cache_ttl_secs   <- 30 * 60
+
+.run_signal_engine_safe <- function() {
+  tryCatch(
+    run_signal_engine(products = VALID_PRODUCTS, output_dir = OUTPUT_BASE, verbose = FALSE),
+    error = function(e) {
+      cat("  [demsup plumber] WARNING — run_signal_engine failed:", conditionMessage(e), "\n")
+      NULL
+    }
+  )
+}
+
+.get_signal_cached <- function(force_refresh = FALSE) {
+  now <- Sys.time()
+  stale <- is.null(.signal_cache$data) || (now - .signal_cache$cached_at) > .signal_cache_ttl_secs
+  if (force_refresh || stale) {
+    .signal_cache$data      <- .run_signal_engine_safe()
+    .signal_cache$cached_at <- now
+  }
+  .signal_cache$data
+}
+
+#* Return today's live trade signal for one product, plus its validated
+#* test-window performance stats (hit rate, EV, total P&L, max drawdown).
+#* @param product_code:character One of CL, LCO, HO, LGO
+#* @serializer unboxedJSON
+#* @get /signal
+function(product_code = "", res) {
+  # NOTE: parameter is named product_code, not product, deliberately —
+  # signal_summary.csv has a column literally named `product`, and
+  # data.table's dt[product == product] would silently always be TRUE
+  # (column compared to itself) if the filter variable were also called
+  # `product`. This is the exact bug class the handover doc flagged as
+  # already having bitten intraday_signal_engine.R once (product == product
+  # loop-variable collision) — naming it differently here avoids it
+  # structurally rather than relying on remembering not to repeat it.
+  product_code <- toupper(trimws(product_code))
+
+  if (!(product_code %in% VALID_PRODUCTS)) {
+    res$status <- 400
+    return(list(
+      error = paste0(
+        "Unknown product '", product_code, "'. Valid: ",
+        paste(VALID_PRODUCTS, collapse = ", ")
+      )
+    ))
+  }
+
+  # run_signal_engine() returns invisible(all_results) directly — NOT a
+  # nested list with $all_results/$summary (confirmed against the real
+  # function body, 2026-06-18; don't assume otherwise again). It writes
+  # output/signal_summary.csv as a side effect, so read that file back for
+  # the summary stats rather than threading them through the return value.
+  all_results <- .get_signal_cached()
+  if (is.null(all_results)) {
+    res$status <- 503
+    return(list(error = "run_signal_engine() failed — check regime_labels_<product>.csv exist under output/<product>/"))
+  }
+
+  prod_result <- all_results[[product_code]]
+  if (is.null(prod_result) || is.null(prod_result$live_signal)) {
+    res$status <- 503
+    return(list(error = paste0("no live signal available for '", product_code, "' — check output/", product_code, "/regime_labels_", product_code, ".csv exists and has non-warmup rows")))
+  }
+
+  summary_row <- NULL
+  summary_path <- file.path(OUTPUT_BASE, "signal_summary.csv")
+  if (file.exists(summary_path)) {
+    sdt  <- fread(summary_path)
+    srow <- sdt[product == product_code]
+    if (nrow(srow) > 0) summary_row <- as.list(srow[1])
+  }
+
+  list(
+    live    = prod_result$live_signal,
+    summary = summary_row
+  )
+}
+
+#* Force a fresh run of the signal engine (re-reads regime_labels_<product>.csv
+#* and re-simulates the full historical trade backtest for all four products).
+#* Call after /refresh has updated the regime classification, so the signal
+#* reflects the latest regime fit rather than a stale cached run.
+#* @serializer unboxedJSON
+#* @post /signal/refresh
+function(res) {
+  all_results <- .get_signal_cached(force_refresh = TRUE)
+  if (is.null(all_results)) {
+    res$status <- 503
+    return(list(error = "run_signal_engine() failed on refresh"))
+  }
+  # all_results IS the function's real return value (invisible(all_results)
+  # from run_signal_engine()) — not a nested $all_results field. See the
+  # /signal endpoint's comment for why this was wrong on the first pass.
+  list(
+    refreshed_at = as.character(Sys.time()),
+    products_ok  = names(all_results)
+  )
 }
