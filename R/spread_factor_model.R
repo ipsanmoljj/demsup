@@ -707,3 +707,348 @@ run_spread_factor_model <- function(root = NULL, train_frac = SFM_TRAIN_FRAC) {
 }
 
 # results <- run_spread_factor_model()
+
+
+# ══ PER-REGIME TRAIN/TEST MODEL ═══════════════════════════════════════════════
+# For each regime independently:
+#   1. Take ALL events classified into that regime (full date range)
+#   2. Sort chronologically, split first TRAIN_FRAC as train, rest as test
+#   3. Fit models on that regime's training events only
+#   4. Evaluate on that regime's test events
+#
+# Key question: does training on regime-pure data improve prediction of
+# future events in that same regime, vs a model trained on all regimes mixed?
+#
+# Z-scores are still computed using the global 70% training cutoff to avoid
+# look-ahead leakage from the test period.
+#
+# Outputs
+#   output/sfm_regime_results.csv   — in-sample metrics per regime model
+#   output/sfm_regime_test.csv      — event-level predictions on regime test sets
+#   output/sfm_regime_report.csv    — test summary per regime/tier/spread
+#   output/sfm_regime_comparison.csv— per-regime vs mixed-regime head-to-head
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Focus tiers: best performer from each estimator family
+SFM_REGIME_TIERS <- c("old_t3_full", "old_t3_xgb",
+                       "sfm_t4_combined", "sfm_t4_xgb",
+                       "sfm_t3_structural")
+
+SFM_REGIME_MIN_EVENTS <- 25L   # minimum events per regime to attempt a split
+
+
+# Fit models for a single regime's training partition
+# (no further regime sub-splitting — single regime = single model per tier/spread)
+.sfm_fit_regime <- function(reg_train, product, regime_name, model_store) {
+  tgts     <- c("m1m2", "m2m3", "m1m6", "fly123", "fly136")
+  tier_set <- SFM_TIERS[SFM_REGIME_TIERS]
+  rows     <- list()
+
+  for (tnm in names(tier_set)) {
+    is_tree   <- .is_tree(tnm)
+    min_obs   <- if (is_tree) max(SFM_MIN_OBS_TREE, SFM_REGIME_MIN_EVENTS) else SFM_MIN_OBS_LINEAR
+    xcols_raw <- tier_set[[tnm]]
+
+    sub <- if (!is_tree && "surprise_z" %in% names(reg_train))
+             reg_train[abs(surprise_z) >= SFM_MIN_SURPRISE_Z]
+           else reg_train
+
+    if (nrow(sub) < min_obs) next
+    xcols <- xcols_raw[xcols_raw %in% names(sub)]
+    if (!length(xcols)) next
+
+    for (tgt in tgts) {
+      y_col <- paste0("d_", tgt)
+      if (!y_col %in% names(sub)) next
+      y   <- sub[[y_col]]
+      Xdt <- sub[, xcols, with = FALSE]
+      for (col in names(Xdt)) set(Xdt, which(!is.finite(Xdt[[col]])), col, 0)
+      X    <- as.matrix(Xdt)
+      keep <- is.finite(y) & apply(is.finite(X), 1, all)
+      if (sum(keep) < min_obs) next
+      Xk <- X[keep, , drop = FALSE]; yk <- y[keep]
+
+      m <- if (is_tree && grepl("_rf$",  tnm)) .fit_rf(Xk, yk, xcols)
+           else if (is_tree && grepl("_xgb$", tnm)) .fit_xgb(Xk, yk, xcols)
+           else .fit_linear(Xk, yk, xcols)
+      if (is.null(m)) next
+
+      # Key: "product||tier||spread||regime" — same schema as global model
+      key <- paste(product, tnm, tgt, regime_name, sep = "||")
+      assign(key, m, envir = model_store)
+
+      st <- .insample_stats(m, Xk, yk)
+      rows[[length(rows) + 1]] <- data.table(
+        product       = product,
+        regime        = regime_name,
+        tier          = tnm,
+        spread_target = tgt,
+        estimator     = m$type,
+        n_train       = nrow(Xk),
+        r2_insample   = st$r2,
+        rmse_train    = st$rmse,
+        hit_train     = st$hit
+      )
+    }
+  }
+  rbindlist(rows, fill = TRUE)
+}
+
+
+# Evaluate a regime's test events using models stored under that regime's key
+.sfm_eval_regime_test <- function(reg_test, model_store, product, regime_name) {
+  tgts     <- c("m1m2", "m2m3", "m1m6", "fly123", "fly136")
+  tier_set <- SFM_TIERS[SFM_REGIME_TIERS]
+  test_sig <- reg_test[abs(surprise_z) >= SFM_MIN_SURPRISE_Z]
+  if (!nrow(test_sig)) return(data.table())
+
+  rbindlist(lapply(seq_len(nrow(test_sig)), function(i) {
+    ev <- test_sig[i]
+
+    rbindlist(lapply(tgts, function(tgt) {
+      yact <- ev[[paste0("d_", tgt)]]
+      if (!is.finite(yact)) return(NULL)
+
+      rbindlist(lapply(names(tier_set), function(tnm) {
+        xcols <- tier_set[[tnm]]
+        xcols <- xcols[xcols %in% names(ev)]
+        if (!length(xcols)) return(NULL)
+
+        key <- paste(product, tnm, tgt, regime_name, sep = "||")
+        if (!exists(key, envir = model_store, inherits = FALSE)) return(NULL)
+        m <- get(key, envir = model_store, inherits = FALSE)
+
+        Xrow <- matrix(
+          sapply(xcols, function(col) { v <- ev[[col]]; if (is.finite(v)) v else 0 }),
+          nrow = 1, dimnames = list(NULL, xcols)
+        )
+        yp <- .sfm_predict(m, Xrow)
+        if (!is.finite(yp)) return(NULL)
+
+        data.table(
+          product       = product,
+          date          = ev$date,
+          regime        = regime_name,
+          tier          = tnm,
+          spread_target = tgt,
+          estimator     = m$type,
+          surprise_z    = round(ev$surprise_z, 3),
+          y_actual      = round(yact, 4),
+          y_pred        = round(yp, 4),
+          correct_sign  = (sign(yp) == sign(yact)),
+          error         = round(yp - yact, 4),
+          abs_error     = round(abs(yp - yact), 4)
+        )
+      }), fill = TRUE)
+    }), fill = TRUE)
+  }), fill = TRUE)
+}
+
+
+run_per_regime_model <- function(root = NULL, train_frac = SFM_TRAIN_FRAC,
+                                  min_events = SFM_REGIME_MIN_EVENTS) {
+  root <- if (!is.null(root)) root else .sfm_root()
+  odir <- file.path(root, "output")
+  if (!dir.exists(odir)) dir.create(odir, recursive = TRUE)
+
+  message("══ Per-Regime Train/Test Model ══════════════════════════════════")
+  message("Train frac  : ", sprintf("%.0f%% / %.0f%%", train_frac*100, (1-train_frac)*100))
+  message("Min events  : ", min_events, " per regime")
+  message("Tiers       : ", paste(SFM_REGIME_TIERS, collapse = ", "))
+
+  message("\n[1] Loading factors...")
+  factors <- .sfm_load_factors(root)
+
+  model_store  <- new.env(parent = emptyenv())
+  all_metrics  <- list()
+  all_test     <- list()
+  regime_info  <- list()
+
+  for (prod in SFM_PRODUCTS) {
+    message("\n── ", prod, " ──────────────────────────────────────────────────")
+
+    spreads <- tryCatch(.sfm_load_spreads(prod, root),
+                        error = function(e) { message("  SKIP: ", e$message); NULL })
+    if (is.null(spreads)) next
+
+    regimes_dt <- tryCatch(.sfm_load_regime(prod, root),
+                           error = function(e) { message("  SKIP: ", e$message); NULL })
+    if (is.null(regimes_dt)) next
+
+    # Global cutoff for z-score normalization (same as main model, no look-ahead)
+    ev_dates <- factors[weekdays(date) == "Wednesday" & !is.na(crude_stocks_chg), date]
+    if (!length(ev_dates)) ev_dates <- factors[weekdays(date) == "Wednesday", date]
+    ev_dates   <- sort(unique(ev_dates))
+    global_cutoff <- ev_dates[floor(length(ev_dates) * train_frac)]
+
+    message("  Building event panel (z-scores anchored to ", global_cutoff, ")...")
+    events <- tryCatch(
+      .sfm_build_panel(spreads, factors, regimes_dt, global_cutoff),
+      error = function(e) { message("  SKIP: ", e$message); NULL }
+    )
+    if (is.null(events) || !nrow(events)) { message("  No events."); next }
+    events <- events[order(date)]
+
+    found_regimes <- sort(unique(na.omit(events$regime)))
+    message("  Regimes found: ", paste(found_regimes, collapse = ", "))
+
+    prod_metrics <- list(); prod_test <- list()
+
+    for (reg in found_regimes) {
+      reg_events <- events[regime == reg][order(date)]
+      n_total <- nrow(reg_events)
+      n_sig   <- nrow(reg_events[abs(surprise_z) >= SFM_MIN_SURPRISE_Z])
+
+      if (n_total < min_events) {
+        message(sprintf("  [%s] only %d events — skip", reg, n_total))
+        next
+      }
+
+      n_train    <- floor(n_total * train_frac)
+      reg_cutoff <- reg_events$date[n_train]
+      reg_train  <- reg_events[date <= reg_cutoff]
+      reg_test   <- reg_events[date >  reg_cutoff]
+      n_sig_test <- nrow(reg_test[abs(surprise_z) >= SFM_MIN_SURPRISE_Z])
+
+      message(sprintf("  [%-22s]  total=%3d  train=%3d (up to %s)  test=%3d  (sig test: %d)",
+                      reg, n_total, nrow(reg_train), reg_cutoff,
+                      nrow(reg_test), n_sig_test))
+
+      regime_info[[paste(prod, reg, sep = "||")]] <- list(
+        product = prod, regime = reg, n_total = n_total,
+        n_train = nrow(reg_train), n_test = nrow(reg_test),
+        n_sig_test = n_sig_test, cutoff = reg_cutoff
+      )
+
+      if (!nrow(reg_train) || n_sig_test < 3) next
+
+      metrics <- tryCatch(
+        .sfm_fit_regime(reg_train, prod, reg, model_store),
+        error = function(e) { message("    ERR fit: ", e$message); NULL }
+      )
+      if (!is.null(metrics) && nrow(metrics)) prod_metrics[[reg]] <- metrics
+
+      test_ev <- tryCatch(
+        .sfm_eval_regime_test(reg_test, model_store, prod, reg),
+        error = function(e) { message("    ERR eval: ", e$message); data.table() }
+      )
+      if (nrow(test_ev)) {
+        prod_test[[reg]] <- test_ev
+        for (tnm in c("old_t3_full", "old_t3_xgb", "sfm_t4_combined", "sfm_t4_xgb")) {
+          q <- test_ev[tier == tnm & spread_target == "m1m2"]
+          if (nrow(q))
+            message(sprintf("    %-18s m1m2  hit=%5.1f%%  RMSE=%.3f  n=%d",
+                            tnm,
+                            mean(q$correct_sign, na.rm = TRUE)*100,
+                            sqrt(mean(q$error^2, na.rm = TRUE)),
+                            nrow(q)))
+        }
+      }
+    }
+
+    if (length(prod_metrics)) all_metrics[[prod]] <- rbindlist(prod_metrics, fill = TRUE)
+    if (length(prod_test))    all_test[[prod]]    <- rbindlist(prod_test,    fill = TRUE)
+  }
+
+  # ── Save ─────────────────────────────────────────────────────────────────────
+  message("\n── Saving outputs ───────────────────────────────────────────────")
+  metrics_dt <- rbindlist(all_metrics, fill = TRUE)
+  test_dt    <- rbindlist(all_test,    fill = TRUE)
+  summary    <- .sfm_summarise(test_dt)
+
+  # Compare per-regime vs global (load sfm_report.csv for global results)
+  global_report_path <- file.path(odir, "sfm_report.csv")
+  global_report <- if (file.exists(global_report_path)) fread(global_report_path) else NULL
+
+  fwrite(metrics_dt, file.path(odir, "sfm_regime_results.csv"))
+  fwrite(test_dt,    file.path(odir, "sfm_regime_test.csv"))
+  fwrite(summary,    file.path(odir, "sfm_regime_report.csv"))
+  message("  Saved: sfm_regime_results.csv, sfm_regime_test.csv, sfm_regime_report.csv")
+
+  # ── Print: hit rate by regime × tier ────────────────────────────────────────
+  spreads_show <- c("m1m2", "m2m3", "m1m6", "fly123", "fly136")
+  focus_tiers  <- SFM_REGIME_TIERS
+
+  cat("\n══ PER-REGIME TEST HIT RATES (%)\n")
+  cat("   Regime-specific model vs. mixed-regime model on same test events\n\n")
+
+  for (prod in SFM_PRODUCTS) {
+    prod_sum <- summary[product == prod & spread_target %in% spreads_show &
+                          tier %in% focus_tiers & regime != "ALL_REGIMES"]
+    if (!nrow(prod_sum)) next
+
+    cat(sprintf("  ── %s ──────────────────────────────────────────\n", prod))
+
+    # Header
+    cat(sprintf("  %-24s %-8s", "Regime", "Spread"))
+    for (tn in focus_tiers) cat(sprintf("  %-13s", substr(tn, 1, 13)))
+    # Global model columns
+    cat(sprintf("  %-13s %-13s", " [global old]", "[global new]"))
+    cat("\n  ", strrep("─", 115), "\n")
+
+    for (reg in sort(unique(prod_sum$regime))) {
+      for (spr in spreads_show) {
+        sub <- prod_sum[regime == reg & spread_target == spr]
+        if (!nrow(sub)) next
+        n_test_reg <- sub$n_test[1]
+        cat(sprintf("  %-24s %-8s", substr(reg, 1, 24), spr))
+        for (tn in focus_tiers) {
+          r <- sub[tier == tn]
+          val <- if (nrow(r)) sprintf("%5.1f%%(n=%d)", r$hit_rate[1]*100, r$n_test[1]) else "      n/a"
+          cat(sprintf("  %-13s", val))
+        }
+        # Global model performance on this regime's test events
+        if (!is.null(global_report)) {
+          go <- global_report[product == prod & spread_target == spr &
+                                regime == reg & tier == "old_t3_full"]
+          gn <- global_report[product == prod & spread_target == spr &
+                                regime == reg & tier == "sfm_t4_combined"]
+          goval <- if (nrow(go)) sprintf("%5.1f%%", go$hit_rate[1]*100) else "   n/a"
+          gnval <- if (nrow(gn)) sprintf("%5.1f%%", gn$hit_rate[1]*100) else "   n/a"
+          cat(sprintf("  %-13s %-13s", goval, gnval))
+        }
+        cat("\n")
+      }
+      cat("\n")
+    }
+  }
+
+  # ── Print: average hit rate improvement per regime ───────────────────────────
+  if (!is.null(global_report) && nrow(summary)) {
+    cat("══ AVERAGE HIT RATE: Per-Regime Model vs Global Model\n")
+    cat(sprintf("  %-10s %-26s %-18s %9s %9s %9s\n",
+                "Product", "Regime", "Best per-regime tier", "PerReg%", "Global%", "Delta"))
+    cat("  ", strrep("─", 85), "\n")
+
+    for (prod in SFM_PRODUCTS) {
+      reg_list <- unique(summary[product == prod & regime != "ALL_REGIMES", regime])
+      for (reg in sort(reg_list)) {
+        # Best per-regime tier (highest hit rate across focus tiers and spreads)
+        pr_sub <- summary[product == prod & regime == reg & tier %in% focus_tiers &
+                            spread_target %in% spreads_show]
+        if (!nrow(pr_sub)) next
+        pr_best <- pr_sub[order(-hit_rate)][1]
+        pr_avg  <- pr_sub[, mean(hit_rate, na.rm = TRUE)]
+
+        # Global model for same regime
+        gl_sub  <- if (!is.null(global_report))
+                     global_report[product == prod & regime == reg &
+                                     tier %in% c("old_t3_full","sfm_t4_combined") &
+                                     spread_target %in% spreads_show]
+                   else data.table()
+        gl_avg  <- if (nrow(gl_sub)) mean(gl_sub$hit_rate, na.rm = TRUE) else NA_real_
+
+        cat(sprintf("  %-10s %-26s %-18s %8.1f%% %8.1f%% %+8.1f%%\n",
+                    prod, substr(reg, 1, 26), substr(pr_best$tier[1], 1, 18),
+                    pr_avg * 100, gl_avg * 100,
+                    (pr_avg - gl_avg) * 100))
+      }
+    }
+    cat("  ", strrep("─", 85), "\n\n")
+  }
+
+  invisible(list(metrics = metrics_dt, test = test_dt, summary = summary))
+}
+
+# regime_results <- run_per_regime_model()
+
