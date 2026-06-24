@@ -1,139 +1,138 @@
 # R/spread_factor_model.R
 # ─────────────────────────────────────────────────────────────────────────────
-# MOTIVATION
-#   inventory_shock_model.R treats EIA as the sole driver and uses other
-#   factors only as interactions with the surprise. This means the surprise
-#   coefficient absorbs ALL mid-week noise (dollar moves, OPEC headlines,
-#   positioning) that happened to coincide with the EIA release.
+# TRAIN / TEST SPLIT DESIGN
+#   Events are sorted by date per product. The first TRAIN_FRAC fraction of
+#   events (default 70%) becomes the training set; the remaining 30% is the
+#   held-out test set. This gives ~80 test events spread across multiple
+#   regimes — far more robust than a single calendar-window OOS.
 #
-#   This script adds STRUCTURAL factors as standalone regressors so the
-#   surprise coefficient captures the PURE incremental EIA effect after
-#   controlling for everything else that moves spreads on any given Wednesday.
+#   All model tiers (old and new) are fit on the SAME training partition and
+#   evaluated on the SAME test partition, so the comparison is apples-to-apples.
 #
-# MODEL EQUATION (sfm_t4_combined tier)
-#   d_spread_t =
-#     α₁·surprise_z + α₂·cushing_z + α₃·gas_z + α₄·dist_z  ← EIA inventory
-#   + β₁·cftc_pos + β₂·dxy + β₃·sofr + β₄·td3c             ← macro / freight
-#   + β₅·5yr_dev + β₆·cushing_5yr + β₇·opec_prod            ← structural
-#   + β₈·hdd_dev + β₉·crack_dev + β₁₀·seasonality           ← demand
-#   + γ₁·(surprise×td3c) + γ₂·(surprise×cftc) + ...         ← amplifiers
-#   + ε_t
+# TIER FAMILIES
+#   OLD model tiers  (replicate inventory_shock_model.R):
+#     old_t1_baseline   — surprise_z only
+#     old_t2_physical   — EIA physical components + Cushing interaction
+#     old_t2_freight    — EIA + freight (TD3C) + interactions
+#     old_t3_full       — all 25 variables from original model
+#
+#   NEW model tiers  (structural factors as standalone regressors):
+#     sfm_t1_eia_only       — surprise_z only (same as old_t1, for parity)
+#     sfm_t2_eia_full       — all 6 EIA product components
+#     sfm_t3_structural     — structural factors, NO EIA (control test)
+#     sfm_t4_combined       — full model: structural + EIA + interactions (~32 vars)
 #
 # OUTPUTS
-#   output/sfm_results.csv            — model metrics + coefficients
-#   output/sfm_oos.csv                — event-level OOS predictions
-#   output/sfm_report.csv             — cleaned comparison table
-#   output/sfm_comparison.csv         — head-to-head vs old model
-#   output/sfm_models.rds             — saved model objects
+#   output/sfm_results.csv      — in-sample metrics + coefficients per model
+#   output/sfm_test.csv         — event-level test-set predictions
+#   output/sfm_report.csv       — test-set summary (hit rate, RMSE, MAE)
+#   output/sfm_comparison.csv   — old vs new side-by-side per spread
+#   output/sfm_models.rds       — model objects
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 # ── Packages ──────────────────────────────────────────────────────────────────
 .ensure_sfm <- function() {
-  req <- c("data.table","lubridate","zoo","glmnet")
-  mis <- req[!vapply(req, requireNamespace, logical(1), quietly=TRUE)]
-  if (length(mis)) install.packages(mis, repos="https://cloud.r-project.org", quiet=TRUE)
+  req <- c("data.table", "lubridate", "zoo", "glmnet")
+  mis <- req[!vapply(req, requireNamespace, logical(1), quietly = TRUE)]
+  if (length(mis)) install.packages(mis, repos = "https://cloud.r-project.org", quiet = TRUE)
 }
 .ensure_sfm()
-suppressPackageStartupMessages({ library(data.table); library(lubridate); library(zoo); library(glmnet) })
+suppressPackageStartupMessages({
+  library(data.table); library(lubridate); library(zoo); library(glmnet)
+})
 
 
-# ── Constants (mirror inventory_shock_model.R) ────────────────────────────────
-SFM_PRODUCTS       <- c("CL","LCO","HO","LGO")
-SFM_OOS_START      <- as.Date("2026-03-01")
-SFM_OOS_END        <- as.Date("2026-06-12")
-SFM_EVENT_WINDOW   <- 2L
-SFM_MIN_OBS        <- 15L
-SFM_MIN_SURPRISE_Z <- 0.4
-SFM_OLS_MIN_N      <- 30L
-SFM_OLS_DOF_RATIO  <- 10L
+# ── Constants ─────────────────────────────────────────────────────────────────
+SFM_TRAIN_FRAC     <- 0.70      # 70% train, 30% test
+SFM_EVENT_WINDOW   <- 2L        # days after EIA release to measure spread change
+SFM_MIN_OBS        <- 15L       # minimum observations to fit any model
+SFM_MIN_SURPRISE_Z <- 0.4       # filter to significant EIA surprises only
+SFM_OLS_MIN_N      <- 30L       # minimum n for OLS (otherwise ridge/lasso)
+SFM_OLS_DOF_RATIO  <- 10L       # n / p must exceed this for OLS
 SFM_SIG_THRESH     <- 0.5
 SFM_TRIM_QUANTILE  <- 0.05
-SFM_UNIT_CONV      <- list(CL=1.0, LCO=1.0, HO=42.0, LGO=1/7.45)
+SFM_UNIT_CONV      <- list(CL = 1.0, LCO = 1.0, HO = 42.0, LGO = 1 / 7.45)
+SFM_PRODUCTS       <- c("CL", "LCO", "HO", "LGO")
 
 
-# ── Factor tier definitions ───────────────────────────────────────────────────
-# Four tiers from narrow (EIA only) to full combined model.
-# Each tier is tested against all 5 spread targets so we can see which
-# factors add explanatory power BEYOND the raw inventory signal.
-
+# ── All tier definitions — OLD and NEW in one table ───────────────────────────
 SFM_TIERS <- list(
 
-  # T1 — identical to old tier1_baseline: single-factor benchmark
+  # ── OLD MODEL TIERS (replicate inventory_shock_model.R) ──────────────────
+
+  old_t1_baseline = c(
+    "surprise_z"
+  ),
+
+  old_t2_physical = c(
+    "surprise_z", "cushing_stocks_chg_z", "refinery_util_dev",
+    "crude_prod_chg_z", "crude_net_exports_z",
+    "sx_cushing", "sx_util"
+  ),
+
+  old_t2_freight = c(
+    "surprise_z", "cushing_stocks_chg_z", "refinery_util_dev",
+    "crude_net_exports_z", "td3c_z52", "td3c_wow_ws_z",
+    "sx_cushing", "sx_td3c"
+  ),
+
+  old_t3_full = c(
+    "surprise_z", "cushing_stocks_chg_z", "refinery_util_dev",
+    "crude_prod_chg_z", "crude_net_exports_z",
+    "gasoline_stocks_chg_z", "distillate_stocks_chg_z",
+    "rig_chg_wow_z", "td3c_z52", "td3c_wow_ws_z", "td3c_storage_cost_z",
+    "bdi_z52", "hdd_dev_5yr_z", "cdd_us_ne", "cftc_mm_net_chg_z",
+    "driving_season", "heating_season", "turnaround_season",
+    "sin_ann", "cos_ann",
+    "sx_cushing", "sx_util", "sx_td3c", "sx_cftc", "sx_5yr_dev"
+  ),
+
+  # ── NEW MODEL TIERS (structural factors as standalone regressors) ─────────
+
+  # Exact same as old_t1 — included to confirm parity
   sfm_t1_eia_only = c(
     "surprise_z"
   ),
 
-  # T2 — all EIA product-level inventory components (crude + gasoline + distillate + production + exports)
-  # Old model never put all 6 EIA components together without also adding interactions
+  # All 6 EIA product components in one regression (no structural controls)
   sfm_t2_eia_full = c(
-    "surprise_z",
-    "cushing_stocks_chg_z",
-    "gasoline_stocks_chg_z",
-    "distillate_stocks_chg_z",
-    "crude_prod_chg_z",
-    "crude_net_exports_z"
+    "surprise_z", "cushing_stocks_chg_z",
+    "gasoline_stocks_chg_z", "distillate_stocks_chg_z",
+    "crude_prod_chg_z", "crude_net_exports_z"
   ),
 
-  # T3 — structural factors ONLY (no EIA surprise at all)
-  # Benchmark: how much of Wednesday spread moves can structural factors explain
-  # without knowing the EIA number?
-  sfm_t3_structural_only = c(
-    "crude_stocks_5yr_dev_z",    # structural surplus/deficit vs 5yr avg
-    "cushing_stocks_5yr_dev_z",  # Cushing structural position
-    "cftc_net_mm_zscore",        # speculative net length (level)
-    "cftc_mm_net_chg_z",         # week-on-week positioning change
-    "td3c_z52",                  # VLCC freight level
-    "td3c_wow_ws_z",             # freight momentum
-    "bdi_z52",                   # dry bulk (demand barometer)
-    "dxy_z",                     # dollar strength
-    "dxy_4wk_chg_z",             # dollar 4-week trend
-    "sofr_z",                    # interest rates / carry cost
-    "opec_prod_z",               # OPEC supply volume
-    "rig_chg_wow_z",             # US rig momentum
-    "refinery_util_dev",         # refinery crude demand
-    "hdd_dev_5yr_z",             # heating demand deviation
-    "cdd_us_ne",                 # cooling demand
-    "gasoil_crack_dev_z",        # crack spread deviation (demand signal)
+  # Structural factors ONLY — no EIA. Shows what macro/freight/positioning
+  # explains on a Wednesday independently of the inventory print.
+  sfm_t3_structural = c(
+    "crude_stocks_5yr_dev_z", "cushing_stocks_5yr_dev_z",
+    "cftc_net_mm_zscore", "cftc_mm_net_chg_z",
+    "td3c_z52", "td3c_wow_ws_z", "bdi_z52",
+    "dxy_z", "dxy_4wk_chg_z", "sofr_z",
+    "opec_prod_z", "rig_chg_wow_z", "refinery_util_dev",
+    "hdd_dev_5yr_z", "cdd_us_ne", "gasoil_crack_dev_z",
     "sin_ann", "cos_ann",
     "driving_season", "heating_season", "turnaround_season"
   ),
 
-  # T4 — full combined: EIA + structural + interaction amplifiers
-  # This is the main new model. surprise_z coefficient = PURE EIA effect
+  # Full combined — structural controls + EIA components + interaction amplifiers
+  # surprise_z coefficient = pure EIA effect after controlling for everything else
   sfm_t4_combined = c(
-    # EIA inventory components
-    "surprise_z",
-    "cushing_stocks_chg_z",
-    "gasoline_stocks_chg_z",
-    "distillate_stocks_chg_z",
-    "crude_prod_chg_z",
-    "crude_net_exports_z",
-    # Structural market factors (standalone — new vs old model)
-    "crude_stocks_5yr_dev_z",
-    "cushing_stocks_5yr_dev_z",
-    "cftc_net_mm_zscore",
-    "cftc_mm_net_chg_z",
-    "td3c_z52",
-    "td3c_wow_ws_z",
-    "bdi_z52",
-    "dxy_z",
-    "dxy_4wk_chg_z",
-    "sofr_z",
-    "opec_prod_z",
-    "rig_chg_wow_z",
-    "refinery_util_dev",
-    "hdd_dev_5yr_z",
-    "cdd_us_ne",
-    "gasoil_crack_dev_z",
+    # EIA inventory
+    "surprise_z", "cushing_stocks_chg_z",
+    "gasoline_stocks_chg_z", "distillate_stocks_chg_z",
+    "crude_prod_chg_z", "crude_net_exports_z",
+    # Structural (standalone — key difference vs old model)
+    "crude_stocks_5yr_dev_z", "cushing_stocks_5yr_dev_z",
+    "cftc_net_mm_zscore", "cftc_mm_net_chg_z",
+    "td3c_z52", "td3c_wow_ws_z", "bdi_z52",
+    "dxy_z", "dxy_4wk_chg_z", "sofr_z",
+    "opec_prod_z", "rig_chg_wow_z", "refinery_util_dev",
+    "hdd_dev_5yr_z", "cdd_us_ne", "gasoil_crack_dev_z",
     "sin_ann", "cos_ann",
     "driving_season", "heating_season", "turnaround_season",
-    # EIA × structural interaction terms (amplifiers)
-    "sx_cushing",
-    "sx_td3c",
-    "sx_cftc",
-    "sx_5yr_dev",
-    "sx_util"
+    # EIA x structural interaction amplifiers
+    "sx_cushing", "sx_td3c", "sx_cftc", "sx_5yr_dev", "sx_util"
   )
 )
 
@@ -143,14 +142,16 @@ SFM_TIERS <- list(
   path <- getwd()
   for (i in seq_len(10)) {
     if (file.exists(file.path(path, ".git"))) return(path)
-    parent <- dirname(path); if (parent == path) break; path <- parent
+    parent <- dirname(path)
+    if (parent == path) break
+    path <- parent
   }
   getwd()
 }
 
 .sfm_zscore <- function(x, train_mask) {
-  mu <- mean(x[train_mask], na.rm=TRUE)
-  sg <- sd(x[train_mask], na.rm=TRUE)
+  mu <- mean(x[train_mask], na.rm = TRUE)
+  sg <- sd(x[train_mask], na.rm = TRUE)
   if (!is.finite(sg) || sg < 1e-10) return(rep(0, length(x)))
   (x - mu) / sg
 }
@@ -160,20 +161,19 @@ SFM_TIERS <- list(
 
 # ── Data loaders ──────────────────────────────────────────────────────────────
 .sfm_load_factors <- function(root) {
-  for (nm in c("factors_extended.csv","factors_combined.csv")) {
+  for (nm in c("factors_extended.csv", "factors_combined.csv")) {
     p <- file.path(root, "output", nm)
-    if (file.exists(p)) {
-      dt <- fread(p); dt[, date := as.Date(date)]
-      # Coerce character columns that should be numeric
-      char_to_num <- c("td3c_z52","td3c_wow_ws","td3c_storage_cost_bbl_mo",
-                       "bdi_z52","bdi","bdi_4wk_chg","rig_count",
-                       "opec_spare_cap_mbd","cftc_mm_net_chg","cftc_prod_short",
-                       "cftc_swap_net","cl_lz")
-      for (col in intersect(char_to_num, names(dt)))
-        set(dt, j=col, value=.to_num(dt[[col]]))
-      message("  Factor file: ", nm, " (", nrow(dt), " rows, ", ncol(dt), " cols)")
-      return(dt)
-    }
+    if (!file.exists(p)) next
+    dt <- fread(p)
+    dt[, date := as.Date(date)]
+    # Columns stored as character that should be numeric
+    char_cols <- c("td3c_z52", "td3c_wow_ws", "td3c_yoy_ws", "td3c_storage_cost_bbl_mo",
+                   "bdi", "bdi_4wk_chg", "bdi_z52", "rig_count",
+                   "opec_spare_cap_mbd", "cftc_mm_net_chg", "cftc_prod_short", "cftc_swap_net")
+    for (col in intersect(char_cols, names(dt)))
+      set(dt, j = col, value = .to_num(dt[[col]]))
+    message("  Factor file: ", nm, " (", nrow(dt), " rows, ", ncol(dt), " cols)")
+    return(dt)
   }
   stop("No factor file found. Run R/factor_loader_extended.R first.")
 }
@@ -181,56 +181,56 @@ SFM_TIERS <- list(
 .sfm_load_spreads <- function(product, root) {
   fname <- file.path(root, paste0(product, "_data.csv"))
   if (!file.exists(fname)) stop("Cannot find ", fname)
-  raw   <- fread(fname, skip=1L, header=TRUE)
-  cols  <- colnames(raw)
+  raw  <- fread(fname, skip = 1L, header = TRUE)
+  cols <- colnames(raw)
   get_mid <- function(cn) {
-    idx <- which(cols == paste0(cn,"||weighted_mid"))
-    if (!length(idx)) idx <- grep(paste0("^",cn,"\\|\\|weighted_mid$"), cols)
+    idx <- grep(paste0("^", cn, "\\|\\|weighted_mid$"), cols)
     if (!length(idx)) return(NULL)
     as.numeric(raw[[cols[idx]]])
   }
   c1 <- get_mid("c1"); c2 <- get_mid("c2")
   c3 <- get_mid("c3"); c6 <- get_mid("c6")
-  if (is.null(c1)||is.null(c2)) stop("c1/c2 not found in ", fname)
-  u  <- SFM_UNIT_CONV[[product]]
+  if (is.null(c1) || is.null(c2)) stop("c1/c2 not found in ", fname)
+  u <- SFM_UNIT_CONV[[product]]
   dt <- data.table(
     date = as.Date(raw[["timestamp"]]),
-    m1=as.numeric(c1), m2=as.numeric(c2),
-    m3=if(!is.null(c3)) as.numeric(c3) else NA_real_,
-    m6=if(!is.null(c6)) as.numeric(c6) else NA_real_
+    m1 = as.numeric(c1), m2 = as.numeric(c2),
+    m3 = if (!is.null(c3)) as.numeric(c3) else NA_real_,
+    m6 = if (!is.null(c6)) as.numeric(c6) else NA_real_
   )
-  dt <- dt[order(date)][, .SD[.N], by=date]
+  dt <- dt[order(date)][, .SD[.N], by = date]
   dt[, `:=`(
-    m1m2   = (m1-m2)*u,
-    m2m3   = if(any(!is.na(m3))) (m2-m3)*u else NA_real_,
-    m1m6   = if(any(!is.na(m6))) (m1-m6)*u else NA_real_,
-    fly123 = if(any(!is.na(m3))) (m1-2*m2+m3)*u else NA_real_,
-    fly136 = if(any(!is.na(m3))&&any(!is.na(m6))) (m1-2*m3+m6)*u else NA_real_
+    m1m2   = (m1 - m2) * u,
+    m2m3   = if (any(!is.na(m3))) (m2 - m3) * u else NA_real_,
+    m1m6   = if (any(!is.na(m6))) (m1 - m6) * u else NA_real_,
+    fly123 = if (any(!is.na(m3))) (m1 - 2 * m2 + m3) * u else NA_real_,
+    fly136 = if (any(!is.na(m3)) && any(!is.na(m6))) (m1 - 2 * m3 + m6) * u else NA_real_
   )]
-  dt[, c("m1","m2","m3","m6") := NULL]
+  dt[, c("m1", "m2", "m3", "m6") := NULL]
   dt
 }
 
 .sfm_load_regime <- function(product, root) {
-  for (nm in paste0(c("regime_labels_","signal_","signals_","classifier_"), product, ".csv")) {
+  for (nm in paste0(c("regime_labels_", "signal_", "signals_", "classifier_"), product, ".csv")) {
     p <- file.path(root, "output", nm)
     if (!file.exists(p)) next
-    dt <- fread(p); dt[, date := as.Date(date)]
-    rc <- intersect(c("regime_label","regime","label"), names(dt))[1]
-    if (!is.na(rc)) return(dt[, .(date, regime=get(rc))])
+    dt <- fread(p)
+    dt[, date := as.Date(date)]
+    rc <- intersect(c("regime_label", "regime", "label"), names(dt))[1]
+    if (!is.na(rc)) return(dt[, .(date, regime = get(rc))])
   }
   stop("No regime file for ", product)
 }
 
 
 # ── Event panel builder ───────────────────────────────────────────────────────
-.sfm_build_panel <- function(spreads, factors, regimes) {
+.sfm_build_panel <- function(spreads, factors, regimes, train_mask_fn) {
   fac <- copy(factors)[order(date)]
 
-  # Derive WoW changes if only levels present
+  # Derive WoW changes from levels where missing
   deriv <- function(chg, lvl) {
     if (!chg %in% names(fac) && lvl %in% names(fac))
-      fac[, (chg) := get(lvl) - shift(get(lvl), 1)]
+      fac[, (chg) := get(lvl) - shift(get(lvl), 1L)]
   }
   deriv("crude_stocks_chg",      "crude_stocks_kb")
   deriv("gasoline_stocks_chg",   "gasoline_stocks_kb")
@@ -238,21 +238,31 @@ SFM_TIERS <- list(
   deriv("cushing_stocks_chg",    "cushing_stocks_kb")
   deriv("crude_prod_chg",        "crude_prod_kbd")
   if ("rig_count" %in% names(fac))
-    set(fac, j="rig_count", value=.to_num(fac[["rig_count"]]))
-  deriv("rig_chg_wow",           "rig_count")
+    set(fac, j = "rig_count", value = .to_num(fac[["rig_count"]]))
+  deriv("rig_chg_wow", "rig_count")
 
-  # Wednesday EIA events
-  inv <- fac[weekdays(date)=="Wednesday" & !is.na(crude_stocks_chg)]
+  # Wednesday EIA events only
+  inv <- fac[weekdays(date) == "Wednesday" & !is.na(crude_stocks_chg)]
   if (!nrow(inv)) {
-    inv <- fac[weekdays(date)=="Wednesday"]
+    inv <- fac[weekdays(date) == "Wednesday"]
     message("  WARN: no crude_stocks_chg — using all Wednesdays")
   }
-  inv <- merge(inv, regimes, by="date", all.x=TRUE)
-  tr  <- inv$date < SFM_OOS_START   # training mask
+  inv <- inv[order(date)]
+  inv <- merge(inv, regimes, by = "date", all.x = TRUE)
 
-  # ── Z-score raw columns on training window ────────────────────────────────
+  # Training mask passed in by caller (based on row index, not calendar date)
+  tr <- train_mask_fn(inv$date)
+
+  # Surprise proxy fallback
+  surprise_raw <- "crude_stocks_surprise"
+  if (!surprise_raw %in% names(inv) || all(is.na(inv[[surprise_raw]]))) {
+    surprise_raw <- "crude_stocks_chg"
+    message("  NOTE: using crude_stocks_chg as surprise proxy")
+  }
+
+  # Z-score raw columns using TRAINING rows only to avoid look-ahead
   raw_z_map <- list(
-    surprise_z               = "crude_stocks_surprise",
+    surprise_z               = surprise_raw,
     cushing_stocks_chg_z     = "cushing_stocks_chg",
     crude_prod_chg_z         = "crude_prod_chg",
     gasoline_stocks_chg_z    = "gasoline_stocks_chg",
@@ -262,7 +272,7 @@ SFM_TIERS <- list(
     hdd_dev_5yr_z            = "hdd_dev_5yr",
     cftc_mm_net_chg_z        = "cftc_mm_net_chg",
     td3c_wow_ws_z            = "td3c_wow_ws",
-    # NEW standalone structural z-scores
+    td3c_storage_cost_z      = "td3c_storage_cost_bbl_mo",
     dxy_z                    = "dxy",
     dxy_4wk_chg_z            = "dxy_4wk_chg",
     sofr_z                   = "sofr",
@@ -272,13 +282,6 @@ SFM_TIERS <- list(
     gasoil_crack_dev_z       = "gasoil_crack_dev"
   )
 
-  # Use crude_stocks_chg as surprise proxy if no consensus column
-  if (!"crude_stocks_surprise" %in% names(inv) ||
-      all(is.na(inv$crude_stocks_surprise))) {
-    raw_z_map[["surprise_z"]] <- "crude_stocks_chg"
-    message("  NOTE: using crude_stocks_chg as surprise proxy")
-  }
-
   for (z_col in names(raw_z_map)) {
     raw_col <- raw_z_map[[z_col]]
     if (raw_col %in% names(inv))
@@ -287,11 +290,13 @@ SFM_TIERS <- list(
       inv[, (z_col) := 0]
   }
 
-  # Pre-z-scored columns: use as-is
-  for (col in c("td3c_z52","bdi_z52","cftc_net_mm_zscore","refinery_util_dev",
-                "sin_ann","cos_ann","driving_season","heating_season",
-                "turnaround_season","cdd_us_ne"))
+  # Pre-normalised columns — use as-is, set to 0 if absent
+  passthrough <- c("td3c_z52", "bdi_z52", "cftc_net_mm_zscore", "refinery_util_dev",
+                   "sin_ann", "cos_ann", "driving_season", "heating_season",
+                   "turnaround_season", "cdd_us_ne")
+  for (col in passthrough)
     if (!col %in% names(inv)) inv[, (col) := 0]
+  if (!"refinery_util_dev" %in% names(inv)) inv[, refinery_util_dev := 0]
 
   # Interaction terms
   inv[, sx_cushing := surprise_z * cushing_stocks_chg_z]
@@ -299,93 +304,94 @@ SFM_TIERS <- list(
   inv[, sx_td3c    := surprise_z * td3c_z52]
   inv[, sx_cftc    := surprise_z * cftc_net_mm_zscore]
   inv[, sx_5yr_dev := surprise_z * crude_stocks_5yr_dev_z]
-
-  for (ic in c("sx_cushing","sx_util","sx_td3c","sx_cftc","sx_5yr_dev"))
+  for (ic in c("sx_cushing", "sx_util", "sx_td3c", "sx_cftc", "sx_5yr_dev"))
     inv[!is.finite(get(ic)), (ic) := 0]
 
   # Compute 2-day spread changes around each EIA event
-  tgts   <- c("m1m2","m2m3","m1m6","fly123","fly136")
-  sp_dt  <- spreads[, c("date", tgts), with=FALSE]
+  tgts  <- c("m1m2", "m2m3", "m1m6", "fly123", "fly136")
+  sp_dt <- spreads[, c("date", tgts), with = FALSE]
 
   rbindlist(lapply(seq_len(nrow(inv)), function(i) {
     rd      <- inv$date[i]
     idx_pre <- which(sp_dt$date <= rd)
-    idx_pos <- which(sp_dt$date >  rd)
+    idx_pos <- which(sp_dt$date > rd)
     if (!length(idx_pre) || length(idx_pos) < SFM_EVENT_WINDOW) return(NULL)
     pre <- sp_dt[tail(idx_pre, 1)]
     pst <- sp_dt[idx_pos[SFM_EVENT_WINDOW]]
     row <- copy(inv[i])
     for (tgt in tgts) row[, paste0("d_", tgt) := pst[[tgt]] - pre[[tgt]]]
     row
-  }), fill=TRUE)
+  }), fill = TRUE)
 }
 
 
-# ── Fitting (same ridge/lasso/OLS logic as inventory_shock_model.R) ───────────
-.sfm_fit <- function(sub, xcols, y_col, filter_sig=TRUE, use_ols=FALSE, trim_y=FALSE) {
+# ── Fitting ───────────────────────────────────────────────────────────────────
+.sfm_fit <- function(sub, xcols, y_col, filter_sig = TRUE, use_ols = FALSE, trim_y = FALSE) {
   if (!y_col %in% names(sub)) return(NULL)
   if (filter_sig && "surprise_z" %in% names(sub))
     sub <- sub[abs(surprise_z) >= SFM_MIN_SURPRISE_Z]
-  y    <- sub[[y_col]]
-  Xdt  <- sub[, xcols, with=FALSE]
+  y   <- sub[[y_col]]
+  Xdt <- sub[, xcols, with = FALSE]
   for (col in names(Xdt)) set(Xdt, which(!is.finite(Xdt[[col]])), col, 0)
   X    <- as.matrix(Xdt)
-  keep <- is.finite(y) & apply(is.finite(X),1,all)
+  keep <- is.finite(y) & apply(is.finite(X), 1, all)
   if (sum(keep) < SFM_MIN_OBS) return(NULL)
-  Xk <- X[keep,,drop=FALSE]; yk <- y[keep]; n <- nrow(Xk); p <- ncol(Xk)
+  Xk <- X[keep, , drop = FALSE]; yk <- y[keep]
+  n <- nrow(Xk); p <- ncol(Xk)
 
   ols_ok <- use_ols && n >= SFM_OLS_MIN_N && p <= floor(n / SFM_OLS_DOF_RATIO)
 
   if (ols_ok) {
     if (trim_y) {
-      ql <- quantile(yk, SFM_TRIM_QUANTILE); qh <- quantile(yk, 1-SFM_TRIM_QUANTILE)
+      ql <- quantile(yk, SFM_TRIM_QUANTILE); qh <- quantile(yk, 1 - SFM_TRIM_QUANTILE)
       tr <- yk >= ql & yk <= qh
-      if (sum(tr) >= SFM_MIN_OBS) { Xk <- Xk[tr,,drop=FALSE]; yk <- yk[tr]; n <- nrow(Xk) }
+      if (sum(tr) >= SFM_MIN_OBS) { Xk <- Xk[tr, , drop = FALSE]; yk <- yk[tr]; n <- nrow(Xk) }
     }
-    fit  <- tryCatch(lm.fit(cbind(1,Xk), yk), error=function(e) NULL)
+    fit  <- tryCatch(lm.fit(cbind(1, Xk), yk), error = function(e) NULL)
     if (is.null(fit)) return(NULL)
-    yh   <- as.numeric(cbind(1,Xk) %*% fit$coefficients)
-    sst  <- sum((yk-mean(yk))^2); ssr <- sum((yk-yh)^2)
-    r2   <- if (sst>0) 1-ssr/sst else NA_real_
-    r2a  <- if (!is.na(r2)&&n>p+1) 1-(1-r2)*(n-1)/(n-p-1) else NA_real_
-    sig  <- if ("surprise_z" %in% colnames(Xk)) abs(Xk[,"surprise_z"])>SFM_SIG_THRESH else rep(TRUE,n)
+    yh   <- as.numeric(cbind(1, Xk) %*% fit$coefficients)
+    sst  <- sum((yk - mean(yk))^2); ssr <- sum((yk - yh)^2)
+    r2   <- if (sst > 0) 1 - ssr / sst else NA_real_
+    r2a  <- if (!is.na(r2) && n > p + 1) 1 - (1 - r2) * (n - 1) / (n - p - 1) else NA_real_
+    sig  <- if ("surprise_z" %in% colnames(Xk)) abs(Xk[, "surprise_z"]) > SFM_SIG_THRESH else rep(TRUE, n)
     coefs <- fit$coefficients
-    cr   <- as.data.table(t(coefs)); setnames(cr, paste0("coef_",c("intercept",colnames(Xk))))
-    return(list(n_events=n, r2_insample=round(r2,4), r2_cv=round(r2a,4),
-                rmse_bbl=round(sqrt(mean((yk-yh)^2)),4),
-                hit_rate=round(mean(sign(yh)==sign(yk),na.rm=TRUE),4),
-                hit_sig=round(if(sum(sig)>=5) mean(sign(yh[sig])==sign(yk[sig]),na.rm=TRUE) else NA_real_,4),
-                n_sig=sum(sig), coef_row=cr, estimator="OLS"))
+    cr   <- as.data.table(t(coefs))
+    setnames(cr, paste0("coef_", c("intercept", colnames(Xk))))
+    return(list(n_events = n, r2_insample = round(r2, 4), r2_adj = round(r2a, 4),
+                rmse_train = round(sqrt(mean((yk - yh)^2)), 4),
+                hit_train = round(mean(sign(yh) == sign(yk), na.rm = TRUE), 4),
+                n_sig_train = sum(sig), coef_row = cr, estimator = "OLS"))
   }
 
-  alpha <- if (n>=40) 1 else 0
-  nf    <- min(5, max(3, floor(n/4)))
-  cvf   <- tryCatch(cv.glmnet(Xk, yk, alpha=alpha, nfolds=nf), error=function(e) NULL)
+  alpha <- if (n >= 40) 1 else 0
+  nf    <- min(5, max(3, floor(n / 4)))
+  cvf   <- tryCatch(cv.glmnet(Xk, yk, alpha = alpha, nfolds = nf), error = function(e) NULL)
   if (is.null(cvf)) return(NULL)
-  fit  <- glmnet(Xk, yk, alpha=alpha, lambda=cvf$lambda.min)
+  fit  <- glmnet(Xk, yk, alpha = alpha, lambda = cvf$lambda.min)
   yh   <- as.numeric(predict(fit, Xk))
-  sst  <- sum((yk-mean(yk))^2); ssr <- sum((yk-yh)^2)
-  r2   <- if (sst>0) 1-ssr/sst else NA_real_
-  r2cv <- tryCatch(1-min(cvf$cvm)/mean((yk-mean(yk))^2), error=function(e) NA_real_)
-  sig  <- if ("surprise_z" %in% colnames(Xk)) abs(Xk[,"surprise_z"])>SFM_SIG_THRESH else rep(TRUE,n)
+  sst  <- sum((yk - mean(yk))^2); ssr <- sum((yk - yh)^2)
+  r2   <- if (sst > 0) 1 - ssr / sst else NA_real_
+  r2cv <- tryCatch(1 - min(cvf$cvm) / mean((yk - mean(yk))^2), error = function(e) NA_real_)
+  sig  <- if ("surprise_z" %in% colnames(Xk)) abs(Xk[, "surprise_z"]) > SFM_SIG_THRESH else rep(TRUE, n)
   coefs <- as.numeric(coef(fit))
-  cr   <- as.data.table(t(coefs)); setnames(cr, paste0("coef_",c("intercept",colnames(Xk))))
-  list(n_events=n, r2_insample=round(r2,4), r2_cv=round(r2cv,4),
-       rmse_bbl=round(sqrt(mean((yk-yh)^2)),4),
-       hit_rate=round(mean(sign(yh)==sign(yk),na.rm=TRUE),4),
-       hit_sig=round(if(sum(sig)>=5) mean(sign(yh[sig])==sign(yk[sig]),na.rm=TRUE) else NA_real_,4),
-       n_sig=sum(sig), coef_row=cr, estimator=if(alpha==0)"Ridge" else "Lasso")
+  cr   <- as.data.table(t(coefs))
+  setnames(cr, paste0("coef_", c("intercept", colnames(Xk))))
+  list(n_events = n, r2_insample = round(r2, 4), r2_adj = round(r2cv, 4),
+       rmse_train = round(sqrt(mean((yk - yh)^2)), 4),
+       hit_train = round(mean(sign(yh) == sign(yk), na.rm = TRUE), 4),
+       n_sig_train = sum(sig), coef_row = cr,
+       estimator = if (alpha == 0) "Ridge" else "Lasso")
 }
 
 
-# ── Fit all tiers × regimes for one product ───────────────────────────────────
+# ── Fit all tiers × regimes for a product's training set ─────────────────────
 .sfm_fit_all <- function(events_train, product) {
-  tgts    <- c("m1m2","m2m3","m1m6","fly123","fly136")
+  tgts    <- c("m1m2", "m2m3", "m1m6", "fly123", "fly136")
   regimes <- c(as.list(unique(na.omit(events_train$regime))), list("ALL_REGIMES"))
 
   rbindlist(lapply(regimes, function(reg) {
-    sub <- if (identical(reg,"ALL_REGIMES")) events_train
-           else events_train[regime==reg]
+    sub <- if (identical(reg, "ALL_REGIMES")) events_train
+           else events_train[regime == reg]
     if (nrow(sub) < SFM_MIN_OBS) return(NULL)
 
     rbindlist(lapply(names(SFM_TIERS), function(tnm) {
@@ -394,232 +400,297 @@ SFM_TIERS <- list(
       if (!length(xcols)) return(NULL)
 
       rbindlist(lapply(tgts, function(tgt) {
-        res <- .sfm_fit(sub, xcols, paste0("d_",tgt), filter_sig=TRUE,
-                        use_ols=TRUE, trim_y=FALSE)
+        res <- .sfm_fit(sub, xcols, paste0("d_", tgt),
+                        filter_sig = TRUE, use_ols = TRUE, trim_y = FALSE)
         if (is.null(res)) return(NULL)
-        cbind(data.table(product=product, regime=as.character(reg), tier=tnm,
-                         spread_target=tgt, estimator=res$estimator,
-                         n_events=res$n_events, r2_insample=res$r2_insample,
-                         r2_cv=res$r2_cv, rmse_bbl=res$rmse_bbl,
-                         hit_rate=res$hit_rate, hit_sig=res$hit_sig,
-                         n_sig=res$n_sig),
+        cbind(data.table(product = product, regime = as.character(reg),
+                         tier = tnm, spread_target = tgt,
+                         estimator = res$estimator,
+                         n_train = res$n_events,
+                         r2_insample = res$r2_insample,
+                         r2_adj = res$r2_adj,
+                         rmse_train = res$rmse_train,
+                         hit_train = res$hit_train,
+                         n_sig_train = res$n_sig_train),
               res$coef_row)
-      }), fill=TRUE)
-    }), fill=TRUE)
-  }), fill=TRUE)
+      }), fill = TRUE)
+    }), fill = TRUE)
+  }), fill = TRUE)
 }
 
 
-# ── OOS evaluation ────────────────────────────────────────────────────────────
-.sfm_oos <- function(events_all, models, product) {
-  oos  <- events_all[date >= SFM_OOS_START & date <= SFM_OOS_END]
-  tgts <- c("m1m2","m2m3","m1m6","fly123","fly136")
-  if (!nrow(oos)) return(data.table())
+# ── Test-set evaluation ───────────────────────────────────────────────────────
+.sfm_evaluate_test <- function(events_test, models, product) {
+  tgts <- c("m1m2", "m2m3", "m1m6", "fly123", "fly136")
+  if (!nrow(events_test)) return(data.table())
 
-  rbindlist(lapply(seq_len(nrow(oos)), function(i) {
-    ev  <- oos[i]
+  rbindlist(lapply(seq_len(nrow(events_test)), function(i) {
+    ev  <- events_test[i]
     if (abs(ev$surprise_z) < SFM_MIN_SURPRISE_Z) return(NULL)
     reg <- if (is.na(ev$regime)) "ALL_REGIMES" else ev$regime
 
     rbindlist(lapply(tgts, function(tgt) {
-      yact <- ev[[paste0("d_",tgt)]]
+      yact <- ev[[paste0("d_", tgt)]]
       if (!is.finite(yact)) return(NULL)
-      prod_key <- product
 
       rbindlist(lapply(names(SFM_TIERS), function(tnm) {
         xcols <- SFM_TIERS[[tnm]]
         xcols <- xcols[xcols %in% names(ev)]
-        mod <- models[product==prod_key & spread_target==tgt & tier==tnm & regime==reg]
-        if (!nrow(mod)) mod <- models[product==prod_key & spread_target==tgt & tier==tnm & regime=="ALL_REGIMES"]
+        # Prefer regime-specific model, fall back to ALL_REGIMES
+        mod <- models[product == product & spread_target == tgt &
+                        tier == tnm & regime == reg]
+        if (!nrow(mod))
+          mod <- models[product == product & spread_target == tgt &
+                          tier == tnm & regime == "ALL_REGIMES"]
         if (!nrow(mod)) return(NULL)
-        fv  <- sapply(xcols, function(col) { v <- ev[[col]]; if (is.finite(v)) v else 0 })
-        cc  <- paste0("coef_", xcols)
-        cc  <- cc[cc %in% names(mod)]
-        cv  <- as.numeric(mod[1, cc, with=FALSE])
-        ic  <- if ("coef_intercept" %in% names(mod)) as.numeric(mod$coef_intercept[1]) else 0
-        yp  <- ic + sum(fv[sub("coef_","",cc)] * cv, na.rm=TRUE)
-        data.table(product=product, date=ev$date, regime=reg, tier=tnm,
-                   spread_target=tgt, surprise_z=round(ev$surprise_z,3),
-                   y_actual=round(yact,4), y_pred=round(yp,4),
-                   correct_sign=(sign(yp)==sign(yact)),
-                   abs_error=round(abs(yp-yact),4), error=round(yp-yact,4))
-      }), fill=TRUE)
-    }), fill=TRUE)
-  }), fill=TRUE)
+        fv <- sapply(xcols, function(col) {
+          v <- ev[[col]]; if (is.finite(v)) v else 0
+        })
+        cc <- paste0("coef_", xcols)
+        cc <- cc[cc %in% names(mod)]
+        cv <- as.numeric(mod[1, cc, with = FALSE])
+        ic <- if ("coef_intercept" %in% names(mod)) as.numeric(mod$coef_intercept[1]) else 0
+        yp <- ic + sum(fv[sub("coef_", "", cc)] * cv, na.rm = TRUE)
+        data.table(product = product, date = ev$date, regime = reg,
+                   tier = tnm, spread_target = tgt,
+                   surprise_z = round(ev$surprise_z, 3),
+                   y_actual = round(yact, 4), y_pred = round(yp, 4),
+                   correct_sign = (sign(yp) == sign(yact)),
+                   error = round(yp - yact, 4),
+                   abs_error = round(abs(yp - yact), 4))
+      }), fill = TRUE)
+    }), fill = TRUE)
+  }), fill = TRUE)
 }
 
-.sfm_summarise_oos <- function(oos) {
-  if (!nrow(oos)) return(data.table())
+
+# ── Summarise test results ────────────────────────────────────────────────────
+.sfm_summarise_test <- function(test_dt) {
+  if (!nrow(test_dt)) return(data.table())
   rbindlist(list(
-    oos[, .(n_events=.N, hit_rate=round(mean(correct_sign,na.rm=TRUE),4),
-            rmse=round(sqrt(mean(error^2,na.rm=TRUE)),4),
-            mae=round(mean(abs_error,na.rm=TRUE),4)),
-        by=.(product,tier,spread_target,regime)],
-    oos[, .(regime="ALL_REGIMES", n_events=.N,
-            hit_rate=round(mean(correct_sign,na.rm=TRUE),4),
-            rmse=round(sqrt(mean(error^2,na.rm=TRUE)),4),
-            mae=round(mean(abs_error,na.rm=TRUE),4)),
-        by=.(product,tier,spread_target)]
-  ), fill=TRUE)
+    test_dt[, .(
+      n_test    = .N,
+      hit_rate  = round(mean(correct_sign, na.rm = TRUE), 4),
+      rmse      = round(sqrt(mean(error^2, na.rm = TRUE)), 4),
+      mae       = round(mean(abs_error, na.rm = TRUE), 4)
+    ), by = .(product, tier, spread_target, regime)],
+    test_dt[, .(
+      regime = "ALL_REGIMES",
+      n_test    = .N,
+      hit_rate  = round(mean(correct_sign, na.rm = TRUE), 4),
+      rmse      = round(sqrt(mean(error^2, na.rm = TRUE)), 4),
+      mae       = round(mean(abs_error, na.rm = TRUE), 4)
+    ), by = .(product, tier, spread_target)]
+  ), fill = TRUE)
 }
 
 
-# ── Comparison helper ─────────────────────────────────────────────────────────
-.load_old_oos <- function(root) {
-  # Load all old OOS variants and pick the best (highest hit rate) per cell
-  variants <- c("v1_ridge_all","v2_ridge_sig","v3_ols_sig","v4_ols_sig_trim")
-  dts <- lapply(variants, function(v) {
-    p <- file.path(root, "output", paste0("ism_oos_",v,".csv"))
-    if (!file.exists(p)) return(NULL)
-    dt <- fread(p); dt[, variant := v]; dt
-  })
-  dts <- dts[!sapply(dts, is.null)]
-  if (!length(dts)) return(NULL)
-  rbindlist(dts, fill=TRUE)
-}
+# ── Build side-by-side comparison: best OLD tier vs best NEW tier ─────────────
+.sfm_build_comparison <- function(summary_dt) {
+  all_reg <- summary_dt[regime == "ALL_REGIMES"]
+  old_tiers <- c("old_t1_baseline", "old_t2_physical", "old_t2_freight", "old_t3_full")
+  new_tiers <- c("sfm_t1_eia_only", "sfm_t2_eia_full", "sfm_t3_structural", "sfm_t4_combined")
 
-.build_comparison <- function(sfm_oos_sum, old_oos, root) {
-  # New model: one row per (product, tier, spread_target) across all regimes
-  sfm_all <- sfm_oos_sum[regime=="ALL_REGIMES",
-                          .(product, tier, spread_target,
-                            n_new=n_events, hit_new=hit_rate, rmse_new=rmse)]
+  old <- all_reg[tier %in% old_tiers]
+  new <- all_reg[tier %in% new_tiers]
 
-  if (is.null(old_oos) || !nrow(old_oos)) return(sfm_all)
+  # Best old tier per cell (highest hit rate, break ties by RMSE)
+  old_best <- old[order(-hit_rate, rmse)][, .SD[1], by = .(product, spread_target)]
+  old_best <- old_best[, .(product, spread_target,
+                            old_best_tier = tier,
+                            old_n = n_test,
+                            old_hit = hit_rate,
+                            old_rmse = rmse,
+                            old_mae = mae)]
 
-  # Old model: best hit rate across all tiers and variants per (product, spread)
-  old_best <- old_oos[abs(surprise_z) >= SFM_MIN_SURPRISE_Z,
-    .(hit_old=round(mean(correct_sign,na.rm=TRUE),4),
-      rmse_old=round(sqrt(mean(error^2,na.rm=TRUE)),4),
-      n_old=.N, best_variant=paste(unique(variant),collapse="|")),
-    by=.(product, spread_target, tier, variant)][
-    order(-hit_old)][
-    , .SD[1], by=.(product, spread_target)]   # best tier×variant per cell
-  old_best[, c("tier","variant") := NULL]
+  # Best new tier per cell
+  new_best <- new[order(-hit_rate, rmse)][, .SD[1], by = .(product, spread_target)]
+  new_best <- new_best[, .(product, spread_target,
+                            new_best_tier = tier,
+                            new_n = n_test,
+                            new_hit = hit_rate,
+                            new_rmse = rmse,
+                            new_mae = mae)]
 
-  merge(sfm_all, old_best, by=c("product","spread_target"), all.x=TRUE)
+  comp <- merge(old_best, new_best, by = c("product", "spread_target"), all = TRUE)
+  comp[, delta_hit  := round(new_hit  - old_hit,  4)]
+  comp[, delta_rmse := round(new_rmse - old_rmse, 4)]
+  comp
 }
 
 
 # ══ MAIN RUNNER ═══════════════════════════════════════════════════════════════
-run_spread_factor_model <- function(root=NULL) {
+run_spread_factor_model <- function(root = NULL, train_frac = SFM_TRAIN_FRAC) {
   root <- if (!is.null(root)) root else .sfm_root()
   odir <- file.path(root, "output")
-  if (!dir.exists(odir)) dir.create(odir, recursive=TRUE)
+  if (!dir.exists(odir)) dir.create(odir, recursive = TRUE)
 
-  message("══ Spread Factor Model ══════════════════════════════════════════")
-  message("Root     : ", root)
-  message("OOS      : ", SFM_OOS_START, " to ", SFM_OOS_END)
-  message("Tiers    : ", paste(names(SFM_TIERS), collapse=" | "))
-  message("Key new factors (vs old model): dxy_z, sofr_z, opec_prod_z,")
-  message("  crude_stocks_5yr_dev_z (standalone), cushing_stocks_5yr_dev_z,")
-  message("  cftc_net_mm_zscore (standalone), gasoil_crack_dev_z,")
-  message("  all EIA product components (gas, distillate) in same regression")
+  message("══ Spread Factor Model — Train/Test Split ═══════════════════════")
+  message("Root       : ", root)
+  message("Train frac : ", sprintf("%.0f%% train / %.0f%% test", train_frac * 100, (1 - train_frac) * 100))
+  message("Tiers      : old (4) + new (4) = 8 total")
+  message("Products   : ", paste(SFM_PRODUCTS, collapse = " | "))
 
   message("\n[1] Loading factors...")
   factors <- .sfm_load_factors(root)
 
-  all_models <- list(); all_oos <- list()
+  all_models <- list(); all_test <- list(); split_info <- list()
 
   for (prod in SFM_PRODUCTS) {
     message("\n── ", prod, " ──────────────────────────────────────────────────")
 
     spreads <- tryCatch(.sfm_load_spreads(prod, root),
-                        error=function(e){message("  SKIP: ",e$message); NULL})
+                        error = function(e) { message("  SKIP: ", e$message); NULL })
     if (is.null(spreads)) next
 
     regimes <- tryCatch(.sfm_load_regime(prod, root),
-                        error=function(e){message("  SKIP: ",e$message); NULL})
+                        error = function(e) { message("  SKIP: ", e$message); NULL })
     if (is.null(regimes)) next
 
     message("  Building event panel...")
-    events <- tryCatch(.sfm_build_panel(spreads, factors, regimes),
-                       error=function(e){message("  SKIP: ",e$message); NULL})
-    if (is.null(events)||!nrow(events)) {message("  No events."); next}
 
-    n_tr  <- nrow(events[date <  SFM_OOS_START])
-    n_oos <- nrow(events[date >= SFM_OOS_START & date <= SFM_OOS_END])
-    n_sig <- nrow(events[date >= SFM_OOS_START & date <= SFM_OOS_END & abs(surprise_z)>=SFM_MIN_SURPRISE_Z])
-    message(sprintf("  Events: train=%d  OOS=%d  (sig OOS: %d)", n_tr, n_oos, n_sig))
+    # Determine train cutoff after we know how many events exist
+    # First pass to get event dates
+    fac_tmp <- copy(factors)[order(date)]
+    ev_dates <- fac_tmp[weekdays(date) == "Wednesday" & !is.na(crude_stocks_chg), date]
+    if (!length(ev_dates)) ev_dates <- fac_tmp[weekdays(date) == "Wednesday", date]
+    n_ev      <- length(ev_dates)
+    n_train   <- floor(n_ev * train_frac)
+    cutoff    <- ev_dates[n_train]
+    message(sprintf("  Events total=%d  train=%d (before %s)  test=%d (from %s)",
+                    n_ev, n_train, cutoff, n_ev - n_train, ev_dates[n_train + 1]))
 
-    train  <- events[date < SFM_OOS_START]
-    message("  Fitting models...")
+    train_mask_fn <- function(dates) dates <= cutoff
+
+    events <- tryCatch(
+      .sfm_build_panel(spreads, factors, regimes, train_mask_fn),
+      error = function(e) { message("  SKIP: ", e$message); NULL }
+    )
+    if (is.null(events) || !nrow(events)) { message("  No events built."); next }
+
+    train <- events[date <= cutoff]
+    test  <- events[date >  cutoff]
+    n_sig_test <- nrow(test[abs(surprise_z) >= SFM_MIN_SURPRISE_Z])
+    message(sprintf("  Panel: train=%d  test=%d  (sig test: %d)",
+                    nrow(train), nrow(test), n_sig_test))
+
+    split_info[[prod]] <- list(cutoff = cutoff, n_train = nrow(train),
+                               n_test = nrow(test), n_sig_test = n_sig_test)
+
+    message("  Fitting models on training set...")
     models <- tryCatch(.sfm_fit_all(train, prod),
-                       error=function(e){message("  ERR fit: ",e$message); NULL})
-    if (is.null(models)||!nrow(models)) next
+                       error = function(e) { message("  ERR fit: ", e$message); NULL })
+    if (is.null(models) || !nrow(models)) next
     all_models[[prod]] <- models
 
-    oos <- tryCatch(.sfm_oos(events, models, prod),
-                    error=function(e){message("  ERR oos: ",e$message); data.table()})
-    if (nrow(oos)) {
-      all_oos[[prod]] <- oos
-      # Quick OOS summary for t4_combined
-      q <- oos[tier=="sfm_t4_combined" & spread_target=="m1m2"]
+    message("  Evaluating on test set...")
+    test_ev <- tryCatch(.sfm_evaluate_test(test, models, prod),
+                        error = function(e) { message("  ERR eval: ", e$message); data.table() })
+    if (nrow(test_ev)) {
+      all_test[[prod]] <- test_ev
+      # Quick summary: best new tier for m1m2
+      q <- test_ev[tier == "sfm_t4_combined" & spread_target == "m1m2"]
       if (nrow(q))
-        message(sprintf("  t4_combined m1m2 OOS: hit=%.1f%%  RMSE=%.3f  n=%d",
-                        mean(q$correct_sign,na.rm=TRUE)*100,
-                        sqrt(mean(q$error^2,na.rm=TRUE)), nrow(q)))
+        message(sprintf("  sfm_t4 m1m2 test: hit=%.1f%%  RMSE=%.3f  n=%d",
+                        mean(q$correct_sign, na.rm = TRUE) * 100,
+                        sqrt(mean(q$error^2, na.rm = TRUE)), nrow(q)))
+      q2 <- test_ev[tier == "old_t3_full" & spread_target == "m1m2"]
+      if (nrow(q2))
+        message(sprintf("  old_t3 m1m2 test: hit=%.1f%%  RMSE=%.3f  n=%d",
+                        mean(q2$correct_sign, na.rm = TRUE) * 100,
+                        sqrt(mean(q2$error^2, na.rm = TRUE)), nrow(q2)))
     }
   }
 
-  # ── Save outputs ─────────────────────────────────────────────────────────────
+  # ── Save ─────────────────────────────────────────────────────────────────────
   message("\n── Saving outputs ───────────────────────────────────────────────")
-  models_dt <- rbindlist(all_models, fill=TRUE)
-  oos_dt    <- rbindlist(all_oos,    fill=TRUE)
-  oos_sum   <- .sfm_summarise_oos(oos_dt)
-  old_oos   <- .load_old_oos(root)
-  comp      <- .build_comparison(oos_sum, old_oos, root)
+  models_dt <- rbindlist(all_models, fill = TRUE)
+  test_dt   <- rbindlist(all_test,   fill = TRUE)
+  summary   <- .sfm_summarise_test(test_dt)
+  comp      <- .sfm_build_comparison(summary)
 
   fwrite(models_dt, file.path(odir, "sfm_results.csv"))
-  fwrite(oos_dt,    file.path(odir, "sfm_oos.csv"))
-  fwrite(oos_sum,   file.path(odir, "sfm_report.csv"))
+  fwrite(test_dt,   file.path(odir, "sfm_test.csv"))
+  fwrite(summary,   file.path(odir, "sfm_report.csv"))
   fwrite(comp,      file.path(odir, "sfm_comparison.csv"))
-  saveRDS(list(models=models_dt, oos=oos_dt, summary=oos_sum, comparison=comp),
+  saveRDS(list(models = models_dt, test = test_dt,
+               summary = summary, comparison = comp,
+               split_info = split_info),
           file.path(odir, "sfm_models.rds"))
-  message("  Saved: sfm_results.csv, sfm_oos.csv, sfm_report.csv,")
+  message("  Saved: sfm_results.csv, sfm_test.csv, sfm_report.csv,")
   message("         sfm_comparison.csv, sfm_models.rds")
 
   # ── Print comparison table ────────────────────────────────────────────────
-  cat("\n══ OOS HIT RATE COMPARISON — ALL_REGIMES, sig surprises only ════\n")
-  cat(sprintf("  %-6s %-8s %-26s %8s %8s  %5s\n",
-              "Prod","Spread","Tier","New hit%","Old hit%","Δ"))
-  cat("  ", strrep("─",68), "\n")
+  cat("\n══ TEST-SET COMPARISON: Best OLD tier vs Best NEW tier ══════════\n")
+  cat(sprintf("  %-6s %-8s  %-22s %6s %6s  %-22s %6s %6s  %7s %7s\n",
+              "Prod", "Spread",
+              "Old best tier", "Hit%", "RMSE",
+              "New best tier", "Hit%", "RMSE",
+              "ΔHit%", "ΔRMSE"))
+  cat("  ", strrep("─", 110), "\n")
 
-  if (nrow(comp)) {
-    comp_show <- comp[spread_target %in% c("m1m2","m2m3","m1m6") &
-                      tier %in% c("sfm_t2_eia_full","sfm_t4_combined")]
-    setorder(comp_show, product, spread_target, tier)
-    for (j in seq_len(nrow(comp_show))) {
-      r  <- comp_show[j]
-      hn <- if (!is.na(r$hit_new)) sprintf("%.1f%%", r$hit_new*100) else "  n/a"
-      ho <- if ("hit_old" %in% names(r) && !is.na(r$hit_old))
-              sprintf("%.1f%%", r$hit_old*100) else "  n/a"
-      dh <- if ("hit_old" %in% names(r) && !is.na(r$hit_old) && !is.na(r$hit_new))
-              sprintf("%+.1f%%",(r$hit_new-r$hit_old)*100) else "   n/a"
-      cat(sprintf("  %-6s %-8s %-26s %8s %8s  %5s\n",
-                  r$product, r$spread_target, r$tier, hn, ho, dh))
+  spreads_show <- c("m1m2", "m2m3", "m1m6", "fly123", "fly136")
+  setorder(comp, product, spread_target)
+  for (j in seq_len(nrow(comp))) {
+    r <- comp[j]
+    if (!r$spread_target %in% spreads_show) next
+    oh <- if (!is.na(r$old_hit))  sprintf("%5.1f%%", r$old_hit  * 100) else "  n/a"
+    nh <- if (!is.na(r$new_hit))  sprintf("%5.1f%%", r$new_hit  * 100) else "  n/a"
+    or <- if (!is.na(r$old_rmse)) sprintf("%6.3f",  r$old_rmse)        else "   n/a"
+    nr <- if (!is.na(r$new_rmse)) sprintf("%6.3f",  r$new_rmse)        else "   n/a"
+    dh <- if (!is.na(r$delta_hit))  sprintf("%+6.1f%%", r$delta_hit  * 100) else "    n/a"
+    dr <- if (!is.na(r$delta_rmse)) sprintf("%+7.3f",   r$delta_rmse)       else "     n/a"
+    cat(sprintf("  %-6s %-8s  %-22s %6s %6s  %-22s %6s %6s  %7s %7s\n",
+                r$product, r$spread_target,
+                r$old_best_tier, oh, or,
+                r$new_best_tier, nh, nr,
+                dh, dr))
+  }
+  cat("  ", strrep("─", 110), "\n\n")
+
+  # ── Print full hit-rate grid ──────────────────────────────────────────────
+  cat("══ FULL HIT RATE GRID — ALL_REGIMES, sig surprises ≥ 0.4σ ══════\n")
+  all_reg_sum <- summary[regime == "ALL_REGIMES"]
+  tier_order  <- c("old_t1_baseline", "old_t2_physical", "old_t2_freight", "old_t3_full",
+                   "sfm_t1_eia_only", "sfm_t2_eia_full", "sfm_t3_structural", "sfm_t4_combined")
+  cat(sprintf("  %-6s %-8s", "Prod", "Spread"))
+  for (tn in tier_order) cat(sprintf("  %-9s", substr(tn, 1, 9)))
+  cat("\n  ", strrep("─", 100), "\n")
+  for (prod in SFM_PRODUCTS) {
+    for (spr in spreads_show) {
+      sub <- all_reg_sum[product == prod & spread_target == spr]
+      cat(sprintf("  %-6s %-8s", prod, spr))
+      for (tn in tier_order) {
+        row <- sub[tier == tn]
+        val <- if (nrow(row)) sprintf("%7.1f%%", row$hit_rate[1] * 100) else "    n/a"
+        cat(sprintf("  %-9s", val))
+      }
+      cat("\n")
     }
   }
-  cat("  ", strrep("─",68), "\n\n")
+  cat("  ", strrep("─", 100), "\n\n")
 
-  # ── Coefficient spotlight for t4_combined ─────────────────────────────────
-  cat("══ LASSO COEFFICIENTS — CL m1m2, ALL_REGIMES, t4_combined ══════\n")
-  cl_coef <- models_dt[product=="CL" & regime=="ALL_REGIMES" &
-                        tier=="sfm_t4_combined" & spread_target=="m1m2"]
-  if (nrow(cl_coef)) {
-    coef_cols <- grep("^coef_", names(cl_coef), value=TRUE)
-    vals <- as.numeric(cl_coef[1, coef_cols, with=FALSE])
-    names(vals) <- sub("^coef_","",coef_cols)
-    vals <- sort(vals[abs(vals)>1e-6], decreasing=TRUE)
-    cat("  Non-zero coefficients (sorted by magnitude):\n")
-    for (nm in names(vals))
-      cat(sprintf("    %-30s  %+.4f\n", nm, vals[nm]))
-  } else {
-    cat("  (No CL m1m2 model found)\n")
+  # ── RMSE grid ────────────────────────────────────────────────────────────
+  cat("══ FULL RMSE GRID ($/bbl) ═══════════════════════════════════════\n")
+  cat(sprintf("  %-6s %-8s", "Prod", "Spread"))
+  for (tn in tier_order) cat(sprintf("  %-9s", substr(tn, 1, 9)))
+  cat("\n  ", strrep("─", 100), "\n")
+  for (prod in SFM_PRODUCTS) {
+    for (spr in spreads_show) {
+      sub <- all_reg_sum[product == prod & spread_target == spr]
+      cat(sprintf("  %-6s %-8s", prod, spr))
+      for (tn in tier_order) {
+        row <- sub[tier == tn]
+        val <- if (nrow(row)) sprintf("%7.3f", row$rmse[1]) else "    n/a"
+        cat(sprintf("  %-9s", val))
+      }
+      cat("\n")
+    }
   }
-  cat("═════════════════════════════════════════════════════════════════\n\n")
+  cat("  ", strrep("─", 100), "\n\n")
 
-  invisible(list(models=models_dt, oos=oos_dt, summary=oos_sum,
-                 comparison=comp))
+  invisible(list(models = models_dt, test = test_dt,
+                 summary = summary, comparison = comp))
 }
 
 # results <- run_spread_factor_model()
