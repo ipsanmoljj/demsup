@@ -14,19 +14,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install R packages used by plumber.R and sourced R files
-RUN install2.r --error --skipinstalled \
-    plumber \
-    jsonlite \
-    data.table \
-    xgboost \
-    glmnet \
-    forecast \
-    strucchange \
-    zoo \
-    lubridate \
-    caret \
-    ranger \
-    && rm -rf /tmp/downloaded_packages
+RUN for i in 1 2 3; do \
+      install2.r --error --skipinstalled \
+        plumber jsonlite data.table xgboost glmnet forecast strucchange zoo lubridate caret ranger \
+      && break || sleep 10; \
+    done && rm -rf /tmp/downloaded_packages
 
 WORKDIR /app
 COPY . .
