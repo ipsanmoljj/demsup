@@ -19,6 +19,8 @@
 #   output/regime_labels_LCO.csv
 #   output/signal_CL.csv
 #   output/signal_LCO.csv
+#   output/trades_CL.csv
+#   output/trades_LCO.csv
 #
 # Run with:  shiny::runApp("dashboard")        (from repo root)
 #   or open this file in RStudio/VSCode and click "Run App"
@@ -59,10 +61,12 @@ PRODUCTS <- c("CL" = "CL — WTI (M1M2)", "LCO" = "LCO — Brent (M1M2)")
 REPO_ROOT <- .find_repo_root()
 
 PATHS <- list(
-  CL  = list(regime = file.path(REPO_ROOT, "output", "regime_labels_CL.csv"),
-            signal = file.path(REPO_ROOT, "output", "signal_CL.csv")),
-  LCO = list(regime = file.path(REPO_ROOT, "output", "regime_labels_LCO.csv"),
-            signal = file.path(REPO_ROOT, "output", "signal_LCO.csv"))
+  CL  = list(regime  = file.path(REPO_ROOT, "output", "regime_labels_CL.csv"),
+             signal  = file.path(REPO_ROOT, "output", "signal_CL.csv"),
+             trades  = file.path(REPO_ROOT, "output", "trades_CL.csv")),
+  LCO = list(regime  = file.path(REPO_ROOT, "output", "regime_labels_LCO.csv"),
+             signal  = file.path(REPO_ROOT, "output", "signal_LCO.csv"),
+             trades  = file.path(REPO_ROOT, "output", "trades_LCO.csv"))
 )
 
 # Regime colour mapping — consistent across all panels
@@ -98,7 +102,6 @@ for (p in names(PATHS)) {
   }
 }
 message("-----------------------------------")
-
 # -----------------------------------------------------------------------------
 # 1. Data loading helpers
 # -----------------------------------------------------------------------------
@@ -133,14 +136,80 @@ load_signal_data <- function(prod) {
 }
 
 # Build a simple per-signal trade record from fwd10 (10-day forward M1M2 change)
-# matching the realised-hit convention used in the Stage 3 stability analysis:
-# SELL signal correct if fwd10 < 0 (spread declined as expected); BUY correct if fwd10 > 0
 build_trade_table <- function(sig_dt) {
   trades <- sig_dt[signal != "FLAT" & !is.na(fwd10)]
   if (nrow(trades) == 0L) return(data.table())
   trades[, correct := fifelse(signal == "SELL", fwd10 < 0, fwd10 > 0)]
-  trades[, .(date, regime_label, signal, level_z_126,
-            fwd10, fwd21, correct)]
+  trades[, .(date, regime_label, signal, level_z_126, fwd10, fwd21, correct)]
+}
+
+load_trades_data <- function(prod) {
+  if (!prod %in% names(PATHS)) return(NULL)
+  path <- PATHS[[prod]]$trades
+  if (is.null(path) || !file.exists(path)) return(NULL)
+  dt <- fread(path)
+  dt[, date := as.Date(date)]
+  setorder(dt, date)
+  dt
+}
+
+build_logs_table <- function(dt, prod) {
+  if (is.null(dt) || nrow(dt) == 0L) return(data.table())
+
+  dt <- copy(dt)
+
+  # Sequential trade name
+  dt[, trade_name := sprintf("%s-%03d", prod, seq_len(.N))]
+
+  # Result
+  dt[, result := fifelse(pnl_net > 0, "Win", "Loss")]
+
+  # Planned target: entry ± 2 × stop_dist (2R target)
+  dt[, planned_target := fifelse(
+    signal == "BUY",
+    entry_price + 2 * stop_dist,
+    entry_price - 2 * stop_dist
+  )]
+
+  # Slippage: not captured in signal engine → flag N/A
+  dt[, slippage := NA_real_]
+
+  # Running cumulative PnL and max drawdown
+  dt[, cum_pnl := cumsum(pnl_net)]
+  dt[, run_max := cummax(cum_pnl)]
+  dt[, max_drawdown := round(cum_pnl - run_max, 4)]
+
+  # Rolling Sharpe (20-trade window, annualised assuming ~252 trades/yr)
+  roll_sharpe <- function(x, w = 20L) {
+    n <- length(x)
+    out <- rep(NA_real_, n)
+    for (i in seq(w, n)) {
+      sl <- x[(i - w + 1L):i]
+      sd_sl <- sd(sl)
+      out[i] <- if (!is.na(sd_sl) && sd_sl > 0) (mean(sl) / sd_sl) * sqrt(252) else NA_real_
+    }
+    out
+  }
+  dt[, rolling_sharpe := round(roll_sharpe(pnl_net), 2)]
+
+  dt[, .(
+    Name           = trade_name,
+    Timestamp      = date,
+    Window         = window,
+    Signal         = signal,
+    Regime         = regime,
+    `Entry Price`  = round(entry_price, 4),
+    `Exit Price`   = round(exit_price, 4),
+    `Stop Loss`    = round(entry_price - fifelse(signal=="BUY", stop_dist, -stop_dist), 4),
+    `Planned Target` = round(planned_target, 4),
+    `Slippage`     = slippage,
+    `PnL Net`      = round(pnl_net, 4),
+    `Max Drawdown` = max_drawdown,
+    `Rolling Sharpe (20T)` = rolling_sharpe,
+    `Bars Held`    = bars_held,
+    `Exit Reason`  = exit_reason,
+    Result         = result
+  )]
 }
 
 # -----------------------------------------------------------------------------
@@ -210,9 +279,9 @@ ui <- fluidPage(
     column(6, DTOutput("regime_perf_table"))
   ),
 
-  div(class = "section-title", "5. Trade-Level Signal History"),
+  div(class = "section-title", "5. Logs — Trade-Level History"),
   fluidRow(
-    column(12, DTOutput("trade_table"))
+    column(12, DTOutput("logs_table"))
   ),
 
   br()
@@ -249,6 +318,15 @@ server <- function(input, output, session) {
 
   trade_data <- reactive({
     build_trade_table(signal_data())
+  })
+
+  logs_data <- reactive({
+    req(input$product)
+    dt <- load_trades_data(input$product)
+    if (is.null(dt)) return(data.table())
+    req(input$date_range)
+    dt <- dt[date >= input$date_range[1] & date <= input$date_range[2]]
+    build_logs_table(dt, input$product)
   })
 
   latest_regime_row <- reactive({
@@ -421,26 +499,26 @@ server <- function(input, output, session) {
     datatable(perf, options = list(pageLength = 10, dom = "tp"), rownames = FALSE)
   })
 
-  # ---- Trade-level table ----
-  output$trade_table <- renderDT({
-    td <- trade_data()
-    if (nrow(td) == 0L) return(NULL)
-
-    disp <- copy(td)
-    disp[, Result := fifelse(correct, "Correct", "Incorrect")]
-    disp <- disp[order(-date), .(
-      Date = date, Regime = regime_label, Signal = signal,
-      `Z-Score` = round(level_z_126, 2),
-      `Fwd 10d` = round(fwd10, 3), `Fwd 21d` = round(fwd21, 3),
-      Result
-    )]
-
-    datatable(disp,
-              options = list(pageLength = 15, order = list(list(0, "desc"))),
-              rownames = FALSE) |>
+  # ---- Logs table (trade-level history from trades CSV) ----
+  output$logs_table <- renderDT({
+    ld <- logs_data()
+    if (is.null(ld) || nrow(ld) == 0L) {
+      return(datatable(data.frame(Message = "No trades found for this product / date range."),
+                       rownames = FALSE))
+    }
+    datatable(
+      ld[order(-Timestamp)],
+      options  = list(pageLength = 20, scrollX = TRUE,
+                      order = list(list(1, "desc"))),
+      rownames = FALSE
+    ) |>
       formatStyle("Result",
-                  backgroundColor = styleEqual(c("Correct", "Incorrect"),
-                                               c("#e3f3e6", "#fbe4e4")))
+                  backgroundColor = styleEqual(c("Win", "Loss"),
+                                               c("#e3f3e6", "#fbe4e4"))) |>
+      formatStyle("Max Drawdown",
+                  color = styleInterval(0, c("#b22222", "#333"))) |>
+      formatCurrency(c("Entry Price","Exit Price","Stop Loss",
+                       "Planned Target","PnL Net"), currency = "", digits = 4)
   })
 }
 
