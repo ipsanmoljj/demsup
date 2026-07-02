@@ -1,6 +1,6 @@
 # Data files — never commit these
 *.csv
-!output/*.csv
+!output/**/*.csv
 *.parquet
 *.h5
 *.feather
