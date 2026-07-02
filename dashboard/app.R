@@ -144,6 +144,9 @@ build_trade_table <- function(sig_dt) {
 }
 
 load_trades_data <- function(prod) {
+  if (is.null(prod) || length(prod) == 0L) return(NULL)
+  if (!prod %in% names(PATHS) && prod %in% PRODUCTS)
+    prod <- names(PRODUCTS)[match(prod, PRODUCTS)]
   if (!prod %in% names(PATHS)) return(NULL)
   path <- PATHS[[prod]]$trades
   if (is.null(path) || !file.exists(path)) return(NULL)
