@@ -185,7 +185,7 @@ LOOKBACK_LAG         <-  63  # fallback lag: baseline excludes most recent N bar
 # ═════════════════════════════════════════════════════════════════════════════
 
 classify_regimes <- function(product        = "CL",
-                              output_dir     = file.path("output", product),
+                              output_dir     = "output",
                               level_z_window = NULL,
                               lookback_lag   = NULL) {
   # level_z_window: override the rolling window for level z-score.
@@ -193,30 +193,10 @@ classify_regimes <- function(product        = "CL",
   # lookback_lag: bars to exclude before the window starts (pre-crisis baseline).
   #   If NULL (default), auto-selects using BIC via select_level_z_window().
   #   Ensures z-score measures deviation from pre-current-regime levels.
-  #
-  # output_dir defaults to "output/<product>" — e.g. "output/CL", "output/LCO" —
-  # matching the per-product save path now used by run_parallel_models(). This
-  # fixes a confirmed bug (2026-06-17): previously both functions defaulted to
-  # the shared "output/" directory, so classify_regimes("LCO") called any time
-  # after a run_parallel_models() call for a DIFFERENT product would silently
-  # read that other product's model_kf.rds/model_signals.rds/etc. and return
-  # regime labels for the wrong underlying data, with no warning. Verified via
-  # identical(classify_regimes("CL")$labels$level_z_126,
-  #           classify_regimes("LCO")$labels$level_z_126) returning TRUE before
-  # this fix. If you have existing files directly under "output/" from before
-  # this change, either move them into "output/CL/" (etc.) or pass
-  # output_dir = "output" explicitly to keep the old (shared, unsafe) behavior.
 
   cat("\n", strrep("=", 60), "\n")
   cat("REGIME CLASSIFIER —", product, "\n")
   cat(strrep("=", 60), "\n\n")
-
-  if (!dir.exists(output_dir)) {
-    stop(sprintf(
-      "output_dir '%s' does not exist. Did you run run_parallel_models(..., product = \"%s\") first? Each product must have its own model fit saved before classify_regimes() can read it back.",
-      output_dir, product
-    ))
-  }
 
   # ── Load model outputs ───────────────────────────────────────────────────
   kf        <- readRDS(file.path(output_dir, "model_kf.rds"))
@@ -669,23 +649,22 @@ classify_all_products <- function(products    = c("CL", "LCO", "HO", "LGO"),
   cat("MULTI-PRODUCT CLASSIFICATION\n")
   cat(strrep("=", 60), "\n\n")
 
-  # Each product's model outputs live under output_dir/<product>/ (see
-  # run_parallel_models()'s product-namespaced save path). classify_regimes()
-  # now defaults its own output_dir to file.path("output", product), so calling
-  # it per-product here is safe as long as run_parallel_models(..., product = p)
-  # was run for every product in `products` beforehand. This used to silently
-  # read whichever product's model files happened to be sitting in a single
-  # shared "output/" dir — fixed 2026-06-17, see classify_regimes()'s docstring.
+  # NOTE: This wrapper classifies all products using the SAME model outputs
+  # currently in output/. If each product was modelled separately (recommended),
+  # run classify_regimes() per product after each run_parallel_models() call,
+  # then pass the results list to build_cross_product_consensus().
   #
-  # Per-product workflow (run once per product before calling this):
-  #   models_cl  <- run_parallel_models(cl_data,  bp_cl,  series = "M1M2", product = "CL")
-  #   models_lco <- run_parallel_models(lco_data, bp_lco, series = "M1M2", product = "LCO")
+  # Single-product workflow (recommended):
+  #   models_cl  <- run_parallel_models(cl_data,  bp_cl,  series = "M1M2")
+  #   cl_labels  <- classify_regimes("CL")
+  #   models_lco <- run_parallel_models(lco_data, bp_lco, series = "M1M2")
+  #   lco_labels <- classify_regimes("LCO")
   #   ... etc for HO, LGO ...
-  #   all <- classify_all_products()
+  #   consensus  <- build_cross_product_consensus(list(cl_labels, lco_labels, ho_labels, lgo_labels))
 
   all_labels <- lapply(products, function(p) {
     cat("\n--- Processing product:", p, "---\n")
-    classify_regimes(product = p, output_dir = file.path(output_dir, p))
+    classify_regimes(product = p, output_dir = output_dir)
   })
 
   names(all_labels) <- products

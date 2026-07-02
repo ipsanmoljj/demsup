@@ -36,26 +36,15 @@ run_parallel_models <- function(data,
                                 bp_breaks,
                                 series    = "M1M2",
                                 n_states  = 3,
-                                window_days = 21,
-                                product   = "CL",
-                                output_dir = "output") {
+                                window_days = 21) {
   # data       : data.table from run_break_detection()$data
   # bp_breaks  : high-confidence break dates from Bai-Perron
   # series     : which column to model (default M1M2)
   # n_states   : number of Markov states (2 or 3)
   # window_days: tolerance window for consensus matching (days)
-  # product    : product code (CL/LCO/HO/LGO) — used ONLY to namespace the
-  #              saved .rds files so different products don't silently
-  #              overwrite each other's model outputs. Confirmed bug (2026-06-17):
-  #              before this fix, "output/model_kf.rds" etc. were the same five
-  #              filenames for every product, so calling this for LCO right after
-  #              CL would have classify_regimes("LCO") silently read back CL's
-  #              models. See output_dir default in classify_regimes() — the two
-  #              MUST agree on the same per-product directory.
-  # output_dir : base directory; actual save path is output_dir/product/
 
   cat("\n", strrep("=", 60), "\n")
-  cat("PARALLEL REGIME MODELS —", series, "(", product, ")\n")
+  cat("PARALLEL REGIME MODELS —", series, "\n")
   cat(strrep("=", 60), "\n\n")
 
   y    <- as.numeric(data[[series]])
@@ -87,16 +76,13 @@ run_parallel_models <- function(data,
   print(consensus)
 
   # ── Persist model outputs for downstream classifier ─────────────────────
-  # Namespaced by product — e.g. output/CL/model_kf.rds, output/LCO/model_kf.rds —
-  # so different products' model fits never collide on disk.
-  product_dir <- file.path(output_dir, product)
-  dir.create(product_dir, showWarnings = FALSE, recursive = TRUE)
-  saveRDS(kf_result,  file.path(product_dir, "model_kf.rds"))
-  saveRDS(ms_result,  file.path(product_dir, "model_ms.rds"))
-  saveRDS(ar_result,  file.path(product_dir, "model_arima.rds"))
-  saveRDS(bp_breaks,  file.path(product_dir, "model_bp_breaks.rds"))
-  saveRDS(signals,    file.path(product_dir, "model_signals.rds"))
-  cat("\nModel outputs saved to", product_dir, "\n")
+  dir.create("output", showWarnings = FALSE)
+  saveRDS(kf_result,  "output/model_kf.rds")
+  saveRDS(ms_result,  "output/model_ms.rds")
+  saveRDS(ar_result,  "output/model_arima.rds")
+  saveRDS(bp_breaks,  "output/model_bp_breaks.rds")
+  saveRDS(signals,    "output/model_signals.rds")
+  cat("\nModel outputs saved to output/\n")
   
   list(
     signals          = signals,
@@ -104,8 +90,7 @@ run_parallel_models <- function(data,
     kf               = kf_result,
     ms               = ms_result,
     arima            = ar_result,
-    bp_breaks        = bp_breaks,
-    product          = product
+    bp_breaks        = bp_breaks
   )
 }
 

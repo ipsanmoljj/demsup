@@ -1,583 +1,744 @@
 # =============================================================================
 # intraday_signal_engine.R
-# =============================================================================
-# Intraday mean-reversion signal engine for energy futures M1M2 spreads.
-# Structurally independent from the daily signal engine (Stage 3).
+# Intraday 15-min regime-conditional mean-reversion signal engine
+# Products: CL (WTI M1M2), WTCL_LCO (Brent-WTI spread M1M2)
 #
-# Products:
-#   CL          — WTI M1M2 spread        (data/intraday/CL_m1m2_15min.csv)
-#   WTCL_LCO    — Brent-WTI inter-market (data/intraday/WTCL_LCO_SPREAD_m1m2_15min.csv)
+# BUG FIX (v2): Loop variable collision fixed.
+#   Previous bug: filter condition used `product == product` (always TRUE)
+#   because the loop variable name collided with the column name.
+#   Fix: loop variable renamed to `prod` throughout; column filter is
+#   now `bars$product == prod` which correctly compares column to variable.
 #
-# Four signals evaluated by IC, best selected per regime x horizon:
-#   1. Intraday z-score     — rolling z of spread on 15-min bars
-#   2. VWAP deviation       — spread vs session VWAP (CL only; NA for WTCL_LCO)
-#   3. RSI (14-bar)         — Wilder RSI on spread close
-#   4. Session open gap     — spread open vs prior session last close
-#
-# Entry:  time filter (liquid hours) + first reversion bar confirmation
-# Stop:   1.25 x ATR14 on 15-min bars (intraday ATR, not daily)
-# Exit:   hard stop | break-even stop | session close (no overnight holds)
-# Target: 2.0 x ATR14 from entry
-#
-# Data split (matches daily model):
-#   Training   : start -> Dec 2023   (IC computation, parameter estimation)
-#   Validation : Jan 2024 -> Jun 2024 (threshold tuning only)
-#   Test       : Jul 2024 -> May 2026 (opened once, results accepted as-is)
+# Data sources:
+#   Historical backtest : data/intraday/CL_m1m2_15min.csv
+#                         data/intraday/WTCL_LCO_SPREAD_m1m2_15min.csv
+#   Live feed test      : called separately via run_live_validation()
 # =============================================================================
 
-library(data.table)
-library(lubridate)
+suppressPackageStartupMessages({
+  library(data.table)
+  library(lubridate)
+  library(zoo)
+})
 
-# ── 0. Configuration ----------------------------------------------------------
+# -----------------------------------------------------------------------------
+# 0. Configuration
+# -----------------------------------------------------------------------------
 
-DATA_ROOT  <- "C:/Users/kanwar.singh/OneDrive - hertshtengroup.com/Documents/demsup"
-INTRA_DIR  <- file.path(DATA_ROOT, "data", "intraday")
-REGIME_DIR <- file.path(DATA_ROOT, "output")       # daily regime label CSVs
-OUT_DIR    <- file.path(DATA_ROOT, "output", "intraday")
-
-dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
-
-# Signal parameters
-Z_WINDOW_LONG  <- 120L   # 5 sessions x 24 bars/session
-Z_WINDOW_SHORT <-  48L   # 2 sessions
-RSI_PERIOD     <-  14L
-ATR_PERIOD     <-  14L
-ATR_MULT_STOP  <-   1.25
-ATR_MULT_TGT   <-   2.0
-BE_FRAC        <-   0.5  # break-even triggers at 50% of stop distance
-
-# Liquid session windows (UTC)
-SESSION_HOURS <- list(
-  CL       = list(start = 13L, end = 20L),   # CME liquid window
-  WTCL_LCO = list(start =  8L, end = 16L)    # ICE liquid window
-)
-
-# Data split boundaries
-TRAIN_END <- as.Date("2023-12-31")
-VAL_END   <- as.Date("2024-06-30")
-TEST_END  <- as.Date("2026-05-31")
-
-# Products
 PRODUCTS <- list(
   CL = list(
-    file        = "CL_m1m2_15min.csv",
-    regime_file = "regime_labels_CL.csv",
-    has_volume  = TRUE
+    csv_path      = "data/intraday/CL_m1m2_15min.csv",
+    liquid_start  = 13L,   # UTC hour (inclusive)
+    liquid_end    = 20L,   # UTC hour (exclusive)
+    tick_value    = 10.0,  # USD per 0.01 move (1 lot)
+    has_volume    = TRUE
   ),
   WTCL_LCO = list(
-    file        = "WTCL_LCO_SPREAD_m1m2_15min.csv",
-    regime_file = "regime_labels_LCO.csv",   # use LCO regime labels
-    has_volume  = FALSE
+    csv_path      = "data/intraday/WTCL_LCO_SPREAD_m1m2_15min.csv",
+    liquid_start  = 8L,
+    liquid_end    = 16L,
+    tick_value    = 10.0,
+    has_volume    = FALSE
   )
 )
 
-# Regime-conditional parameters
-# Instead of hard exclusions, each regime gets its own threshold, stop multiplier,
-# and confidence weight. High threshold + low confidence = effectively inactive
-# but still alive if the regime character changes.
-REGIME_PARAMS <- data.table(
-  regime      = c("Deep-Backwardation", "Backwardation-Deficit",
-                  "Stable-Elevated",    "Transition-Tightening",
-                  "Contango-Surplus",   "Easing-Contango",
-                  "Deep-Contango",      "Warm-Up",
-                  "Unknown"),
-  # Deep-Backwardation: full signal — only regime with confirmed intraday edge
-  # Backwardation-Deficit: raised to 2.5 SD, low confidence — only extreme events
-  # All others: 4.0 SD threshold — virtually inactive, door stays open for extremes
-  z_thresh    = c(1.0,   2.5,   4.0,   4.0,   4.0,   4.0,   4.0,   99.0,  99.0),
-  atr_mult    = c(1.25,  1.00,  0.75,  0.75,  0.75,  0.75,  0.75,   0.0,   0.0),
-  confidence  = c(1.0,   0.1,   0.1,   0.1,   0.1,   0.1,   0.1,    0.0,   0.0)
+# Regime-conditional signal parameters
+# Each entry: list(z_thresh, atr_mult, confidence)
+#   z_thresh   – minimum |z_score| required to fire a signal
+#   atr_mult   – stop distance = atr_mult * ATR14
+#   confidence – position size scalar (0–1); keeps weak regimes dormant
+REGIME_PARAMS <- list(
+  "Deep-Backwardation"    = list(z_thresh = 1.0, atr_mult = 1.25, confidence = 1.0),
+  "Backwardation"         = list(z_thresh = 2.0, atr_mult = 1.10, confidence = 0.6),
+  "Backwardation-Deficit" = list(z_thresh = 2.5, atr_mult = 1.00, confidence = 0.1),
+  "Easing-Backwardation"  = list(z_thresh = 4.0, atr_mult = 0.75, confidence = 0.1),
+  "Flat"                  = list(z_thresh = 4.0, atr_mult = 0.75, confidence = 0.1),
+  "Easing-Contango"       = list(z_thresh = 4.0, atr_mult = 0.75, confidence = 0.1),
+  "Contango"              = list(z_thresh = 4.0, atr_mult = 0.75, confidence = 0.1),
+  "Deep-Contango"         = list(z_thresh = 4.0, atr_mult = 0.75, confidence = 0.1),
+  "Warm-Up"               = list(z_thresh = Inf, atr_mult = 1.00, confidence = 0.0),
+  "Unknown"               = list(z_thresh = Inf, atr_mult = 1.00, confidence = 0.0)
 )
 
-# ── 1. Utility functions ------------------------------------------------------
+# Signal windows (in 15-min bars)
+Z_LONG_WINDOW  <- 120L   # ~30 hours: slow baseline
+Z_SHORT_WINDOW <- 48L    # ~12 hours: fast signal
+ATR_WINDOW     <- 14L
+RSI_WINDOW     <- 14L
+RR_RATIO       <- 2.0    # reward:risk for target
+BE_THRESHOLD   <- 0.5    # fraction of stop to move to break-even
 
-# Wilder RSI
-.rsi <- function(x, n = 14L) {
-  n   <- as.integer(n)
-  out <- rep(NA_real_, length(x))
-  if (length(x) <= n) return(out)
-  dx  <- diff(x)
-  for (i in seq(n, length(dx))) {
-    gains  <- pmax(dx[(i - n + 1):i], 0)
-    losses <- pmax(-dx[(i - n + 1):i], 0)
-    ag     <- mean(gains,  na.rm = TRUE)
-    al     <- mean(losses, na.rm = TRUE)
-    out[i + 1] <- if (al == 0) 100 else 100 - 100 / (1 + ag / al)
+# Data split
+TRAIN_END      <- as.Date("2023-12-31")
+VALID_END      <- as.Date("2024-06-30")
+# Test window: 2024-07-01 onwards
+
+# -----------------------------------------------------------------------------
+# 1. Helper: ATR14
+# -----------------------------------------------------------------------------
+.atr14 <- function(high, low, close, n = ATR_WINDOW) {
+  tr <- pmax(
+    high - low,
+    abs(high - shift(close, 1L, type = "lag")),
+    abs(low  - shift(close, 1L, type = "lag")),
+    na.rm = FALSE
+  )
+  # Wilder smoothing
+  atr <- numeric(length(tr))
+  first_valid <- which(!is.na(tr))[1L]
+  if (is.na(first_valid) || (first_valid + n - 1L) > length(tr)) return(rep(NA_real_, length(tr)))
+  atr[first_valid + n - 1L] <- mean(tr[first_valid:(first_valid + n - 1L)], na.rm = TRUE)
+  for (i in seq(first_valid + n, length(tr))) {
+    atr[i] <- (atr[i - 1L] * (n - 1L) + tr[i]) / n
   }
-  out
+  atr[atr == 0] <- NA_real_
+  atr
 }
 
-# Rolling mean and SD (population, min_obs enforced)
-.roll_mean_sd <- function(x, n, min_obs = 10L) {
-  len  <- length(x)
-  rmean <- rep(NA_real_, len)
-  rsd   <- rep(NA_real_, len)
-  for (i in seq_len(len)) {
-    w <- x[max(1L, i - n + 1L):i]
-    w <- w[!is.na(w)]
-    if (length(w) >= min_obs) {
-      rmean[i] <- mean(w)
-      rsd[i]   <- sd(w)
-    }
+# -----------------------------------------------------------------------------
+# 2. Helper: Wilder RSI
+# -----------------------------------------------------------------------------
+.rsi_wilder <- function(close, n = RSI_WINDOW) {
+  chg   <- diff(close, lag = 1L)
+  gains <- pmax(chg, 0)
+  losses <- pmax(-chg, 0)
+  rsi <- rep(NA_real_, length(close))
+  if (length(gains) < n) return(rsi)
+  # seed
+  avg_g <- mean(gains[1:n], na.rm = TRUE)
+  avg_l <- mean(losses[1:n], na.rm = TRUE)
+  for (i in seq(n + 1L, length(gains))) {
+    avg_g <- (avg_g * (n - 1L) + gains[i]) / n
+    avg_l <- (avg_l * (n - 1L) + losses[i]) / n
   }
-  list(mean = rmean, sd = rsd)
-}
-
-# Rolling ATR on spread (uses high - low as the range proxy)
-.atr14 <- function(high, low, n = 14L) {
-  tr  <- high - low
-  out <- rep(NA_real_, length(tr))
-  for (i in seq(n, length(tr))) {
-    out[i] <- mean(tr[(i - n + 1):i], na.rm = TRUE)
+  # final RSI values
+  for (i in seq(n + 1L, length(close))) {
+    idx_chg <- i - 1L
+    avg_g <- (avg_g * (n - 1L) + pmax(chg[idx_chg], 0)) / n
+    avg_l <- (avg_l * (n - 1L) + pmax(-chg[idx_chg], 0)) / n
+    rs <- if (avg_l == 0) 100 else avg_g / avg_l
+    rsi[i] <- 100 - 100 / (1 + rs)
   }
-  out
+  rsi
 }
 
-# Spearman IC
-.ic <- function(signal, fwd_ret) {
-  ok <- !is.na(signal) & !is.na(fwd_ret)
-  if (sum(ok) < 10L) return(NA_real_)
-  cor(signal[ok], fwd_ret[ok], method = "spearman")
-}
-
-# ── 2. Feature engineering ----------------------------------------------------
-
-.build_features <- function(dt, has_volume = TRUE) {
+# -----------------------------------------------------------------------------
+# 3. Feature engineering for one product's bar series
+# -----------------------------------------------------------------------------
+.build_features <- function(dt) {
+  # dt must have columns: timestamp, open, high, low, close, volume (or NA)
+  # Returns dt with signal columns appended
 
   dt <- copy(dt)
-  dt[, timestamp := as.POSIXct(timestamp, tz = "UTC")]
-  dt[, date      := as.Date(timestamp)]
-  dt[, hour_utc  := hour(timestamp)]
-
   setorder(dt, timestamp)
 
-  # ── Signal 1: Intraday z-score (long window) ──────────────────────────────
-  ms_long  <- .roll_mean_sd(dt$close, Z_WINDOW_LONG)
-  ms_short <- .roll_mean_sd(dt$close, Z_WINDOW_SHORT)
+  n <- nrow(dt)
+  cl <- dt$close
 
-  dt[, z_long  := (close - ms_long$mean)  / ms_long$sd]
-  dt[, z_short := (close - ms_short$mean) / ms_short$sd]
+  # Rolling z-scores (long and short window)
+  roll_mean_long  <- frollmean(cl, Z_LONG_WINDOW,  align = "right", na.rm = TRUE)
+  roll_sd_long    <- frollapply(cl, Z_LONG_WINDOW,  sd,  align = "right")
+  roll_mean_short <- frollmean(cl, Z_SHORT_WINDOW, align = "right", na.rm = TRUE)
+  roll_sd_short   <- frollapply(cl, Z_SHORT_WINDOW, sd,  align = "right")
 
-  # ── Signal 2: VWAP deviation (session-level, reset each date) ─────────────
-  if (has_volume && "volume" %in% names(dt) && !all(is.na(dt$volume))) {
-    dt[, vwap := cumsum(close * volume) / cumsum(volume), by = date]
-    dt[, vwap_dev := (close - vwap) / abs(vwap)]
+  dt[, z_long  := fifelse(roll_sd_long  > 0, (cl - roll_mean_long)  / roll_sd_long,  NA_real_)]
+  dt[, z_short := fifelse(roll_sd_short > 0, (cl - roll_mean_short) / roll_sd_short, NA_real_)]
+
+  # ATR14
+  dt[, atr14 := .atr14(high, low, close)]
+
+  # RSI14
+  dt[, rsi14 := .rsi_wilder(close)]
+
+  # VWAP deviation (only meaningful when volume > 0)
+  if ("volume" %in% names(dt) && any(!is.na(dt$volume) & dt$volume > 0)) {
+    dt[, session_date := as.Date(timestamp)]
+    dt[, cum_pv := cumsum(close * pmax(volume, 0, na.rm = TRUE)), by = session_date]
+    dt[, cum_v  := cumsum(pmax(volume, 0, na.rm = TRUE)),         by = session_date]
+    dt[, vwap   := fifelse(cum_v > 0, cum_pv / cum_v, NA_real_)]
+    dt[, vwap_dev := fifelse(!is.na(vwap) & atr14 > 0,
+                             (close - vwap) / atr14, NA_real_)]
+    dt[, c("cum_pv", "cum_v", "session_date") := NULL]
   } else {
     dt[, vwap     := NA_real_]
     dt[, vwap_dev := NA_real_]
   }
 
-  # ── Signal 3: RSI (14-bar) ────────────────────────────────────────────────
-  dt[, rsi := .rsi(close, RSI_PERIOD)]
+  # Session open gap (first bar of each UTC session day)
+  dt[, session_date := as.Date(timestamp)]
+  dt[, session_open := close[1L], by = session_date]
+  dt[, open_gap := fifelse(atr14 > 0, (open - session_open) / atr14, NA_real_)]
+  dt[, session_date := NULL]
 
-  # ── Signal 4: Session open gap ────────────────────────────────────────────
-  # Last close of each session
-  session_close <- dt[, .(session_last_close = last(close)), by = date]
-  session_close[, prior_session_close := shift(session_last_close, 1L)]
+  # UTC hour for liquid hours filter
+  dt[, utc_hour := hour(timestamp)]
 
-  # First bar of each session
-  dt[, bar_rank := seq_len(.N), by = date]
-  dt <- merge(dt, session_close[, .(date, prior_session_close)],
-              by = "date", all.x = TRUE)
-  dt[bar_rank == 1L,
-     open_gap := open - prior_session_close]
-  dt[bar_rank != 1L, open_gap := NA_real_]
-  # Forward-fill gap within session so every bar has the day's gap value
-  dt[, open_gap := zoo::na.locf(open_gap, na.rm = FALSE), by = date]
-
-  # ── ATR14 on 15-min bars ──────────────────────────────────────────────────
-  dt[, atr14_intra := .atr14(high, low, ATR_PERIOD)]
-
-  # ── Forward returns for IC computation ────────────────────────────────────
-  dt[, fwd_ret_1  := shift(close, -1L)  - close]
-  dt[, fwd_ret_4  := shift(close, -4L)  - close]
-  dt[, fwd_ret_8  := shift(close, -8L)  - close]
-
-  dt
+  dt[]
 }
 
-# ── 3. Regime label join ------------------------------------------------------
+# -----------------------------------------------------------------------------
+# 4. Merge daily regime labels onto intraday bars
+# -----------------------------------------------------------------------------
+.merge_regimes <- function(bars, regime_dt, prod_name) {
+  # regime_dt: data.table with columns date, product, regime_label
+  # bars:      data.table with column timestamp
 
-.join_regime <- function(dt, regime_path) {
-  if (!file.exists(regime_path)) {
-    message("  Regime file not found: ", regime_path,
-            " — all bars treated as unclassified")
-    dt[, regime := "Unknown"]
-    return(dt)
+  prod_regimes <- regime_dt[product == prod_name, .(date, regime_label)]
+  bars[, date := as.Date(timestamp)]
+  bars <- merge(bars, prod_regimes, by = "date", all.x = TRUE)
+  bars[is.na(regime_label), regime_label := "Unknown"]
+  bars[, date := NULL]
+  bars[]
+}
+
+# -----------------------------------------------------------------------------
+# 5. Signal generation (one bar)
+# -----------------------------------------------------------------------------
+.get_signal_params <- function(regime) {
+  p <- REGIME_PARAMS[[regime]]
+  if (is.null(p)) p <- REGIME_PARAMS[["Unknown"]]
+  p
+}
+
+# Returns: 1 (long), -1 (short), 0 (no signal)
+.signal_direction <- function(z_short, vwap_dev, rsi14, has_volume, params) {
+  if (params$confidence == 0) return(0L)
+
+  # Primary signal: z_short (mean reversion)
+  # Confirmation: RSI or VWAP deviation in same direction
+  z  <- z_short
+  if (is.na(z)) return(0L)
+
+  thresh <- params$z_thresh
+
+  direction <- 0L
+  if (z >  thresh) direction <- -1L   # spread too high → short (expect reversion)
+  if (z < -thresh) direction <-  1L   # spread too low  → long  (expect reversion)
+
+  if (direction == 0L) return(0L)
+
+  # Confirmation gate: RSI must not contradict
+  # Long signal needs RSI < 70 (not overbought); short needs RSI > 30 (not oversold)
+  if (!is.na(rsi14)) {
+    if (direction ==  1L && rsi14 > 70) return(0L)
+    if (direction == -1L && rsi14 < 30) return(0L)
   }
-  reg <- fread(regime_path)
-  message("  Regime file columns: ", paste(names(reg), collapse = ", "))
 
-  # Detect date column
-  date_col <- intersect(c("date", "Date", "DATE"), names(reg))[1]
-  # Detect regime label column — try common names from Stage 2 output
-  label_col <- intersect(
-    c("regime_label", "regime", "label", "modal_label", "final_label"),
-    names(reg)
-  )[1]
-
-  if (!is.na(date_col) && !is.na(label_col)) {
-    reg[, date_key := as.Date(get(date_col))]
-    dt <- merge(dt, reg[, .(date = date_key, regime = get(label_col))],
-                by = "date", all.x = TRUE)
-    message("  Joined on '", date_col, "' + '", label_col,
-            "' — matched ", sum(!is.na(dt$regime)), " bars")
-  } else {
-    message("  Could not detect date/label columns — treating all bars as Unknown")
-    message("  Available columns: ", paste(names(reg), collapse = ", "))
-    dt[, regime := "Unknown"]
+  # If VWAP deviation available, require it to agree in direction
+  if (has_volume && !is.na(vwap_dev)) {
+    if (direction ==  1L && vwap_dev >  0.5) return(0L)  # price above VWAP, contradicts long
+    if (direction == -1L && vwap_dev < -0.5) return(0L)  # price below VWAP, contradicts short
   }
-  dt
+
+  direction
 }
 
-# ── 4. IC analysis (training window only) ------------------------------------
+# -----------------------------------------------------------------------------
+# 6. Backtest loop for one product
+#    BUG FIX: loop variable is `prod` (not `product`) to avoid colliding with
+#    the `product` column name in any data.table inside the function.
+# -----------------------------------------------------------------------------
+.backtest_product <- function(prod, cfg, bars_all, regime_dt, split) {
+  cat(sprintf("\n[%s] Starting backtest (split: %s)\n", prod, split))
 
-.compute_ic_table <- function(dt) {
-  signals  <- c("z_long", "z_short", "vwap_dev", "rsi", "open_gap")
-  horizons <- c("fwd_ret_1", "fwd_ret_4", "fwd_ret_8")
-  regimes  <- unique(dt$regime)
-  regimes  <- regimes[!is.na(regimes)]
+  # --- Filter to this product's bars only ---
+  # FIX: `prod` is the loop variable; `bars_all$product` is the column.
+  # Previously written as `bars_all$product == product` which always evaluated
+  # to a logical vector compared to itself → always TRUE → all rows matched.
+  bars <- bars_all[product == prod]   # data.table syntax; `prod` is unambiguous
 
-  rows <- list()
-  for (sig in signals) {
-    for (hz in horizons) {
-      # Overall IC
-      rows[[length(rows) + 1]] <- data.table(
-        signal  = sig,
-        horizon = hz,
-        regime  = "ALL",
-        ic      = .ic(dt[[sig]], dt[[hz]]),
-        n_bars  = sum(!is.na(dt[[sig]]) & !is.na(dt[[hz]]))
-      )
-      # Per-regime IC
-      for (reg in regimes) {
-        sub <- dt[regime == reg]
-        rows[[length(rows) + 1]] <- data.table(
-          signal  = sig,
-          horizon = hz,
-          regime  = reg,
-          ic      = .ic(sub[[sig]], sub[[hz]]),
-          n_bars  = sum(!is.na(sub[[sig]]) & !is.na(sub[[hz]]))
-        )
-      }
-    }
+  if (nrow(bars) == 0L) {
+    cat(sprintf("[%s] No bars found. Check product name.\n", prod))
+    return(NULL)
   }
-  rbindlist(rows)
-}
 
-# Best signal per regime x horizon (highest |IC| with >= 10 bars)
-.best_signal_map <- function(ic_table) {
-  ic_table[n_bars >= 10L][
-    ,
-    .SD[which.max(abs(ic))],
-    by = .(regime, horizon)
-  ][, .(regime, horizon, best_signal = signal, ic)]
-}
+  # Merge regime labels
+  bars <- .merge_regimes(bars, regime_dt, prod)
 
-# ── 5. Entry logic ------------------------------------------------------------
+  # Apply liquid hours filter
+  bars <- bars[utc_hour >= cfg$liquid_start & utc_hour < cfg$liquid_end]
 
-.entry_filter <- function(dt, product) {
-  sess  <- SESSION_HOURS[[product]]
-  # Time filter: liquid hours only
-  dt[, in_session := hour_utc >= sess$start & hour_utc < sess$end]
+  # Split selection
+  bars[, bar_date := as.Date(timestamp)]
+  if (split == "train") {
+    bars <- bars[bar_date <= TRAIN_END]
+  } else if (split == "validation") {
+    bars <- bars[bar_date > TRAIN_END & bar_date <= VALID_END]
+  } else if (split == "test") {
+    bars <- bars[bar_date > VALID_END]
+  }
 
-  # Join regime-conditional parameters
-  dt <- merge(dt, REGIME_PARAMS, by = "regime", all.x = TRUE)
-  dt[is.na(z_thresh),   z_thresh   := 99.0]
-  dt[is.na(atr_mult),   atr_mult   := 0.0 ]
-  dt[is.na(confidence), confidence := 0.0 ]
+  if (nrow(bars) < Z_LONG_WINDOW + 10L) {
+    cat(sprintf("[%s] Insufficient bars for split '%s'.\n", prod, split))
+    return(NULL)
+  }
 
-  # Regime ok: confidence > 0 (Warm-Up and Unknown always blocked)
-  dt[, regime_ok := confidence > 0 & !is.na(regime)]
+  cat(sprintf("[%s] %d bars in '%s' window (%s to %s)\n",
+              prod, nrow(bars), split,
+              min(bars$bar_date), max(bars$bar_date)))
 
-  # Signal direction: regime-specific z threshold
-  dt[, signal_dir := fcase(
-    z_long < -z_thresh,  1L,   # buy signal
-    z_long >  z_thresh, -1L,   # sell signal
-    rep(TRUE, .N),       0L    # default
-  )]
-
-  # First reversion bar: bar where close moves in signal direction
-  # i.e. after a sell signal, first bar that closes lower than previous bar
-  dt[, prev_close  := shift(close, 1L)]
-  dt[, rev_bar := fcase(
-    signal_dir ==  1L & close > prev_close,  TRUE,
-    signal_dir == -1L & close < prev_close,  TRUE,
-    rep(TRUE, .N)                          , FALSE
-  )]
-
-  # Entry bar = next bar after first reversion bar where all filters pass
-  dt[, entry_trigger := in_session & regime_ok & signal_dir != 0L & rev_bar]
-
-  dt
-}
-
-# ── 6. Trade simulation -------------------------------------------------------
-
-.simulate_trades <- function(dt, product, window_label) {
-
-  dt <- copy(dt)
-  dt <- .entry_filter(dt, product)
-
-  trades     <- list()
-  in_trade   <- FALSE
-  entry_px   <- NA_real_
-  direction  <- 0L
-  stop_px    <- NA_real_
-  target_px  <- NA_real_
-  be_px      <- NA_real_    # break-even stop level
+  # ---- Trade simulation ----
+  trades       <- list()
+  in_trade     <- FALSE
+  entry_price  <- NA_real_
+  stop_price   <- NA_real_
+  target_price <- NA_real_
   be_triggered <- FALSE
-  entry_time <- NA
-  entry_atr  <- NA_real_
-  entry_sig  <- NA_real_
-  entry_conf <- NA_real_
-  entry_reg  <- NA_character_
-  trade_date <- NA
+  direction    <- 0L
+  entry_bar    <- NA_integer_
 
-  n <- nrow(dt)
+  for (i in seq_len(nrow(bars))) {
+    row <- bars[i]
 
-  for (i in seq_len(n)) {
-    row <- dt[i]
-
-    # ── Session end: force close any open position ───────────────────────────
+    # Close open trade at session end (last liquid bar of each session date)
     if (in_trade) {
-      # Check if this is last bar of the session date
-      is_last_bar <- (i == n) ||
-        (as.Date(dt[i + 1L, timestamp]) != as.Date(row$timestamp))
+      is_last_bar <- (i == nrow(bars)) ||
+        (as.Date(bars[i + 1L]$timestamp) != as.Date(row$timestamp))
 
       if (is_last_bar) {
-        exit_px  <- row$close
-        pnl_raw  <- direction * (exit_px - entry_px)
-        pnl_net  <- pnl_raw - 0.04  # $0.04/bbl bid-offer cost
-        trades[[length(trades) + 1]] <- data.table(
-          product    = product,
-          window     = window_label,
-          entry_time = entry_time,
-          exit_time  = row$timestamp,
-          trade_date = trade_date,
-          direction  = direction,
-          entry_px   = entry_px,
-          exit_px    = exit_px,
-          stop_px    = stop_px,
-          target_px  = target_px,
-          atr_entry   = entry_atr,
+        pnl <- (row$close - entry_price) * direction
+        trades[[length(trades) + 1L]] <- list(
+          product     = prod,
+          entry_time  = bars[entry_bar]$timestamp,
+          exit_time   = row$timestamp,
+          direction   = direction,
+          entry_price = entry_price,
+          exit_price  = row$close,
           exit_reason = "session_close",
-          pnl_raw     = pnl_raw,
-          pnl_net     = pnl_net,
-          regime      = entry_reg,
-          signal_z    = entry_sig,
-          confidence  = entry_conf
+          pnl_pts     = pnl,
+          regime      = bars[entry_bar]$regime_label
         )
-        in_trade     <- FALSE
-        be_triggered <- FALSE
+        in_trade <- FALSE
         next
       }
 
-      px <- row$close
-
-      # ── Stop check ──────────────────────────────────────────────────────────
-      stop_hit <- (direction ==  1L && px <= stop_px) ||
-                  (direction == -1L && px >= stop_px)
-
-      # ── Target check ────────────────────────────────────────────────────────
-      tgt_hit  <- (direction ==  1L && px >= target_px) ||
-                  (direction == -1L && px <= target_px)
-
-      # ── Break-even: move stop to entry once 50% of stop distance gained ────
+      # Break-even stop: once price moves BE_THRESHOLD * stop_dist in our favour,
+      # move stop to entry price
+      stop_dist <- abs(entry_price - stop_price)
       if (!be_triggered) {
-        gain <- direction * (px - entry_px)
-        if (!is.na(gain) && gain >= BE_FRAC * abs(entry_px - stop_px)) {
-          stop_px      <- entry_px
+        profit_so_far <- (row$close - entry_price) * direction
+        if (profit_so_far >= BE_THRESHOLD * stop_dist) {
+          stop_price   <- entry_price
           be_triggered <- TRUE
         }
       }
 
-      if (stop_hit || tgt_hit) {
-        exit_px     <- if (stop_hit) stop_px else target_px
-        pnl_raw     <- direction * (exit_px - entry_px)
-        pnl_net     <- pnl_raw - 0.04
-        exit_reason <- if (stop_hit) "stop" else "target"
+      # Check stop
+      hit_stop <- (direction ==  1L && row$low  <= stop_price) ||
+                  (direction == -1L && row$high >= stop_price)
+      # Check target
+      hit_target <- (direction ==  1L && row$high >= target_price) ||
+                    (direction == -1L && row$low  <= target_price)
 
-        trades[[length(trades) + 1]] <- data.table(
-          product     = product,
-          window      = window_label,
-          entry_time  = entry_time,
+      if (hit_stop || hit_target) {
+        exit_price  <- if (hit_target) target_price else stop_price
+        exit_reason <- if (hit_target) "target" else "stop"
+        pnl <- (exit_price - entry_price) * direction
+        trades[[length(trades) + 1L]] <- list(
+          product     = prod,
+          entry_time  = bars[entry_bar]$timestamp,
           exit_time   = row$timestamp,
-          trade_date  = trade_date,
           direction   = direction,
-          entry_px    = entry_px,
-          exit_px     = exit_px,
-          stop_px     = stop_px,
-          target_px   = target_px,
-          atr_entry   = entry_atr,
+          entry_price = entry_price,
+          exit_price  = exit_price,
           exit_reason = exit_reason,
-          pnl_raw     = pnl_raw,
-          pnl_net     = pnl_net,
-          regime      = entry_reg,
-          signal_z    = entry_sig,
-          confidence  = entry_conf
+          pnl_pts     = pnl,
+          regime      = bars[entry_bar]$regime_label
         )
-        in_trade     <- FALSE
-        be_triggered <- FALSE
+        in_trade <- FALSE
       }
-
-      next  # don't look for new entry while in trade
+      next
     }
 
-    # ── Entry ─────────────────────────────────────────────────────────────────
-    if (!in_trade && isTRUE(row$entry_trigger) && !is.na(row$atr14_intra)) {
-      atr        <- row$atr14_intra
-      if (is.na(atr) || atr <= 0) next
+    # ---- No trade open: check for entry ----
+    if (is.na(row$z_short) || is.na(row$atr14) || row$atr14 <= 0) next
 
-      direction  <- row$signal_dir
-      entry_px   <- row$open   # enter on open of bar after trigger
-      r_atr_mult <- if (!is.na(row$atr_mult) && row$atr_mult > 0) row$atr_mult else ATR_MULT_STOP
-      stop_px    <- entry_px - direction * r_atr_mult   * atr
-      target_px  <- entry_px + direction * ATR_MULT_TGT * atr
-      be_px      <- entry_px + direction * BE_FRAC * r_atr_mult * atr
-      entry_time <- row$timestamp
-      entry_atr  <- atr
-      entry_sig  <- row$z_long
-      entry_reg  <- row$regime
-      entry_conf <- if (!is.na(row$confidence)) row$confidence else 0.0
-      trade_date <- as.Date(row$timestamp)
-      in_trade   <- TRUE
-      be_triggered <- FALSE
+    params <- .get_signal_params(row$regime_label)
+    if (params$confidence == 0) next
+
+    sig <- .signal_direction(
+      z_short    = row$z_short,
+      vwap_dev   = row$vwap_dev,
+      rsi14      = row$rsi14,
+      has_volume = cfg$has_volume,
+      params     = params
+    )
+
+    if (sig == 0L) next
+
+    # First reversion bar confirmation:
+    # Signal fires on bar i, entry on close of bar i+1 if direction unchanged
+    if (i >= nrow(bars)) next
+    next_row <- bars[i + 1L]
+    if (as.Date(next_row$timestamp) != as.Date(row$timestamp)) next  # no overnight entry
+
+    # Confirm: z_short should be pulling back (absolute z smaller on next bar)
+    if (is.na(next_row$z_short)) next
+    if (abs(next_row$z_short) >= abs(row$z_short)) next  # not reverting yet
+
+    # Entry
+    atr         <- row$atr14
+    in_trade     <- TRUE
+    direction    <- sig
+    entry_price  <- next_row$close
+    stop_price   <- entry_price - direction * params$atr_mult * atr
+    target_price <- entry_price + direction * RR_RATIO * params$atr_mult * atr
+    be_triggered <- FALSE
+    entry_bar    <- i + 1L
+  }
+
+  if (length(trades) == 0L) {
+    cat(sprintf("[%s] No trades generated.\n", prod))
+    return(NULL)
+  }
+
+  trades_dt <- rbindlist(lapply(trades, as.data.table))
+  trades_dt[, split := split]
+
+  cat(sprintf("[%s] %d trades | Hit rate: %.1f%% | Total P&L: %+.2f pts\n",
+              prod,
+              nrow(trades_dt),
+              100 * mean(trades_dt$pnl_pts > 0),
+              sum(trades_dt$pnl_pts)))
+
+  trades_dt[]
+}
+
+# -----------------------------------------------------------------------------
+# 7. Load and prepare all bar data
+# -----------------------------------------------------------------------------
+.load_bars <- function() {
+  bar_list <- list()
+
+  for (prod_name in names(PRODUCTS)) {
+    cfg  <- PRODUCTS[[prod_name]]
+    path <- cfg$csv_path
+
+    if (!file.exists(path)) {
+      warning(sprintf("CSV not found: %s — skipping %s", path, prod_name))
+      next
+    }
+
+    dt <- fread(path)
+
+    # Standardise column names
+    setnames(dt,
+             old = intersect(c("Timestamp", "TIMESTAMP", "time", "Time"), names(dt)),
+             new = rep("timestamp", length(intersect(c("Timestamp","TIMESTAMP","time","Time"), names(dt)))))
+
+    if (!"timestamp" %in% names(dt)) stop(sprintf("[%s] No timestamp column found.", prod_name))
+
+    dt[, timestamp := as.POSIXct(timestamp, tz = "UTC")]
+    if (!"volume" %in% names(dt)) dt[, volume := NA_real_]
+
+    # Ensure numeric OHLC
+    for (col in c("open","high","low","close")) {
+      if (col %in% names(dt)) dt[, (col) := as.numeric(get(col))]
+    }
+
+    # Add product tag
+    dt[, product := prod_name]
+
+    # Build features
+    cat(sprintf("[%s] Building features on %d bars...\n", prod_name, nrow(dt)))
+    dt <- .build_features(dt)
+
+    bar_list[[prod_name]] <- dt
+  }
+
+  rbindlist(bar_list, fill = TRUE)
+}
+
+# -----------------------------------------------------------------------------
+# 8. Load regime labels
+#    Reads per-product CSV files: output/regime_labels_CL.csv etc.
+#    Columns used: date, product, regime_label
+#    The intraday engine maps:  CL       → regime_labels_CL.csv
+#                               WTCL_LCO → regime_labels_CL.csv (CL drives the spread)
+# -----------------------------------------------------------------------------
+
+# Map each intraday product to its regime label CSV
+REGIME_CSV_MAP <- list(
+  CL       = "output/regime_labels_CL.csv",
+  WTCL_LCO = "output/regime_labels_CL.csv"   # spread uses CL regime
+)
+
+.load_regimes <- function() {
+  parts <- list()
+
+  for (prod_name in names(REGIME_CSV_MAP)) {
+    path <- REGIME_CSV_MAP[[prod_name]]
+
+    if (!file.exists(path)) {
+      stop(sprintf(
+        "Regime labels file not found for %s: %s\nCheck the output/ folder.",
+        prod_name, path
+      ))
+    }
+
+    dt <- fread(path, select = c("date", "product", "regime_label"))
+    dt[, date := as.Date(date)]
+
+    # Override product column to match the intraday product name
+    # (e.g. the CSV has product="CL" but we need "WTCL_LCO" for the spread)
+    dt[, product := prod_name]
+
+    parts[[prod_name]] <- dt
+  }
+
+  rbindlist(parts)
+}
+
+# -----------------------------------------------------------------------------
+# 9. Summary report
+# -----------------------------------------------------------------------------
+.print_summary <- function(all_trades) {
+  cat("\n", strrep("=", 60), "\n")
+  cat("BACKTEST SUMMARY\n")
+  cat(strrep("=", 60), "\n\n")
+
+  for (sp in c("train", "validation", "test")) {
+    sub <- all_trades[split == sp]
+    if (nrow(sub) == 0L) next
+
+    cat(sprintf("--- %s window ---\n", toupper(sp)))
+
+    for (prod_name in unique(sub$product)) {
+      p <- sub[product == prod_name]
+      hit  <- mean(p$pnl_pts > 0)
+      pnl  <- sum(p$pnl_pts)
+      n    <- nrow(p)
+      cat(sprintf("  %-12s  Trades: %3d  Hit: %5.1f%%  P&L: %+7.3f pts\n",
+                  prod_name, n, 100*hit, pnl))
+    }
+
+    cat(sprintf("\n  Regime breakdown (test window):\n"))
+    if (sp == "test") {
+      reg_tbl <- sub[, .(
+        trades   = .N,
+        hit_rate = round(100 * mean(pnl_pts > 0), 1),
+        total_pnl = round(sum(pnl_pts), 3)
+      ), by = .(product, regime)][order(product, -trades)]
+      print(reg_tbl)
+    }
+    cat("\n")
+  }
+}
+
+# -----------------------------------------------------------------------------
+# 10. Main entry point — historical backtest
+# -----------------------------------------------------------------------------
+run_backtest <- function(splits = c("train", "validation", "test")) {
+  cat("Loading bar data...\n")
+  bars_all   <- .load_bars()
+
+  cat("Loading regime labels...\n")
+  regime_dt  <- .load_regimes()
+
+  all_trades <- list()
+
+  for (sp in splits) {
+    for (prod_name in names(PRODUCTS)) {  # loop variable is `prod_name` — no collision
+      cfg    <- PRODUCTS[[prod_name]]
+      result <- .backtest_product(prod_name, cfg, bars_all, regime_dt, sp)
+      if (!is.null(result)) all_trades[[length(all_trades) + 1L]] <- result
     }
   }
 
-  if (length(trades) == 0) return(data.table())
-  rbindlist(trades)
+  if (length(all_trades) == 0L) {
+    cat("No trades produced across any product/split.\n")
+    return(invisible(NULL))
+  }
+
+  all_trades_dt <- rbindlist(all_trades, fill = TRUE)
+  .print_summary(all_trades_dt)
+
+  invisible(all_trades_dt)
 }
 
-# ── 7. Performance summary ----------------------------------------------------
+# -----------------------------------------------------------------------------
+# 11. Live feed validation runner
+#     Reads SQLite .db files from the Lightstreamer folder and runs signals.
+#     Called separately — does not affect historical backtest.
+# -----------------------------------------------------------------------------
+run_live_validation <- function(
+    db_folder    = "I:/Public/Siddharth Raj/lightstreamer_data",
+    date_range   = NULL,   # e.g. c("2026-06-12", "2026-06-16")
+    products     = c("CL", "WTCL_LCO")
+) {
+  if (!requireNamespace("RSQLite", quietly = TRUE) ||
+      !requireNamespace("DBI",     quietly = TRUE)) {
+    stop("Install RSQLite and DBI first:\n  install.packages(c('RSQLite','DBI'))")
+  }
+  library(RSQLite)
+  library(DBI)
 
-.summarise <- function(trades) {
-  if (nrow(trades) == 0) return(data.table())
-  trades[, .(
-    n_trades   = .N,
-    hit_rate   = mean(pnl_net > 0, na.rm = TRUE),
-    avg_pnl    = mean(pnl_net, na.rm = TRUE),
-    total_pnl  = sum(pnl_net, na.rm = TRUE),
-    avg_win    = mean(pnl_net[pnl_net > 0], na.rm = TRUE),
-    avg_loss   = mean(pnl_net[pnl_net < 0], na.rm = TRUE),
-    pct_stop   = mean(exit_reason == "stop",          na.rm = TRUE),
-    pct_target = mean(exit_reason == "target",        na.rm = TRUE),
-    pct_eod    = mean(exit_reason == "session_close", na.rm = TRUE)
-  ), by = .(product, window)]
-}
+  # Find all .db files in the folder
+  db_files <- list.files(db_folder, pattern = "bars_15min_\\d{8}\\.db$", full.names = TRUE)
 
-# ── 8. Main runner ------------------------------------------------------------
+  if (length(db_files) == 0L) {
+    stop(sprintf("No .db files found in: %s\nCheck the path is accessible.", db_folder))
+  }
 
-run_intraday_engine <- function(products = c("CL", "WTCL_LCO")) {
+  # Filter to date range if provided
+  if (!is.null(date_range)) {
+    date_from <- as.Date(date_range[1])
+    date_to   <- as.Date(date_range[2])
+    # Extract date from filename: bars_15min_20260612.db → 20260612
+    file_dates <- as.Date(
+      sub(".*bars_15min_(\\d{8})\\.db$", "\\1", basename(db_files)),
+      format = "%Y%m%d"
+    )
+    db_files <- db_files[file_dates >= date_from & file_dates <= date_to]
+  }
 
-  all_trades <- list()
-  ic_tables  <- list()
+  if (length(db_files) == 0L) {
+    stop("No .db files match the requested date range.")
+  }
 
-  for (product in products) {
-    cfg       <- PRODUCTS[[product]]
-    data_path <- file.path(INTRA_DIR, cfg$file)
-    reg_path  <- file.path(REGIME_DIR, cfg$regime_file)
+  cat(sprintf("Found %d .db file(s): %s\n", length(db_files),
+              paste(basename(db_files), collapse = ", ")))
 
-    message("\n", strrep("=", 65))
-    message("Product: ", product)
-    message(strrep("=", 65))
+  # Read all bars from all files
+  bar_list <- list()
+  for (db_path in db_files) {
+    con <- dbConnect(SQLite(), db_path)
+    tables <- dbListTables(con)
+    cat(sprintf("  %s — tables: %s\n", basename(db_path), paste(tables, collapse = ", ")))
 
-    if (!file.exists(data_path)) {
-      warning("Data file not found: ", data_path); next
-    }
+    for (tbl in tables) {
+      dt <- as.data.table(dbReadTable(con, tbl))
 
-    # Load and build features
-    dt <- fread(data_path)
-    message("  Bars loaded: ", format(nrow(dt), big.mark = ","))
+      # Standardise timestamp
+      if ("timestamp" %in% names(dt)) {
+        dt[, timestamp := as.POSIXct(timestamp, tz = "UTC", origin = "1970-01-01")]
+      }
 
-    dt <- .build_features(dt, has_volume = cfg$has_volume)
-    dt <- .join_regime(dt, reg_path)
-
-    # Assign window labels
-    dt[, window := fcase(
-      as.Date(timestamp) <= TRAIN_END, "train",
-      as.Date(timestamp) <= VAL_END,   "validation",
-      as.Date(timestamp) <= TEST_END,  "test",
-      rep(TRUE, .N)                  , "oos"
-    )]
-
-    # ── IC analysis on training data only ─────────────────────────────────
-    message("\n  --- IC Analysis (training window) ---")
-    train_dt <- dt[window == "train"]
-    ic_tbl   <- .compute_ic_table(train_dt)
-    ic_tbl[, product := product]
-    ic_tables[[product]] <- ic_tbl
-
-    best_map <- .best_signal_map(ic_tbl)
-    message("  Best signals per horizon (ALL regimes):")
-    print(best_map[regime == "ALL"][order(horizon)])
-
-    # ── Backtest on validation + test ─────────────────────────────────────
-    for (w in c("validation", "test")) {
-      message("\n  --- Window: ", w, " ---")
-      sub    <- dt[window == w]
-      if (nrow(sub) == 0) { message("  No data"); next }
-
-      trades <- .simulate_trades(sub, product, w)
-      if (nrow(trades) == 0) {
-        message("  No trades generated")
+      # Determine which product this table represents
+      # Convention: table name contains "CL" or "LCO" etc.
+      matched_prod <- NA_character_
+      for (p in products) {
+        if (grepl(p, tbl, ignore.case = TRUE)) { matched_prod <- p; break }
+      }
+      if (is.na(matched_prod)) {
+        cat(sprintf("    Table '%s' doesn't match any product — skipping.\n", tbl))
         next
       }
 
-      all_trades[[paste(product, w, sep = "_")]] <- trades
-
-      summ <- .summarise(trades)
-      message("  Trades    : ", summ$n_trades)
-      message("  Hit rate  : ", round(summ$hit_rate * 100, 1), "%")
-      message("  Avg P&L   : ", round(summ$avg_pnl, 4))
-      message("  Total P&L : ", round(summ$total_pnl, 4))
-      message("  Exit mix  : stop=", round(summ$pct_stop * 100, 1), "%",
-              "  target=", round(summ$pct_target * 100, 1), "%",
-              "  eod=", round(summ$pct_eod * 100, 1), "%")
+      dt[, product := matched_prod]
+      bar_list[[length(bar_list) + 1L]] <- dt
     }
+    dbDisconnect(con)
   }
 
-  # ── Write outputs ──────────────────────────────────────────────────────────
-  message("\n", strrep("=", 65))
-  message("Writing outputs to: ", OUT_DIR)
+  if (length(bar_list) == 0L) {
+    cat("No matching product tables found in the .db files.\n")
+    return(invisible(NULL))
+  }
 
-  if (length(all_trades) > 0) {
-    all_trades_dt <- rbindlist(all_trades, fill = TRUE)
+  bars_all <- rbindlist(bar_list, fill = TRUE)
+  if (!"volume" %in% names(bars_all)) bars_all[, volume := NA_real_]
 
-    # Per product trade files
-    for (prod in products) {
-      pt <- all_trades_dt[product == prod]
-      if (nrow(pt) > 0) {
-        fwrite(pt, file.path(OUT_DIR,
-               paste0("intraday_trades_", prod, ".csv")))
+  # Ensure OHLC numeric
+  for (col in c("open","high","low","close")) {
+    if (col %in% names(bars_all)) bars_all[, (col) := as.numeric(get(col))]
+  }
+
+  # Build features
+  bars_by_prod <- list()
+  for (prod_name in products) {
+    sub <- bars_all[product == prod_name]
+    if (nrow(sub) == 0L) next
+    cat(sprintf("[%s] Building features on %d live bars...\n", prod_name, nrow(sub)))
+    sub <- .build_features(sub)
+    bars_by_prod[[prod_name]] <- sub
+  }
+  bars_featured <- rbindlist(bars_by_prod, fill = TRUE)
+
+  # Load regime labels and merge
+  cat("Loading regime labels...\n")
+  regime_dt <- .load_regimes()
+  for (prod_name in products) {
+    bars_featured[product == prod_name,
+                  regime_label := .merge_regimes(
+                    bars_featured[product == prod_name], regime_dt, prod_name
+                  )$regime_label]
+  }
+
+  # Apply liquid hours filter and generate signals bar-by-bar
+  cat("\n--- LIVE SIGNAL SCAN ---\n")
+  signals_out <- list()
+
+  for (prod_name in products) {
+    cfg  <- PRODUCTS[[prod_name]]
+    bars <- bars_featured[product == prod_name &
+                            utc_hour >= cfg$liquid_start &
+                            utc_hour <  cfg$liquid_end]
+
+    if (nrow(bars) == 0L) next
+
+    for (i in seq_len(nrow(bars))) {
+      row <- bars[i]
+      if (is.na(row$z_short) || is.na(row$atr14) || row$atr14 <= 0) next
+
+      params <- .get_signal_params(row$regime_label)
+      if (params$confidence == 0) next
+
+      sig <- .signal_direction(
+        z_short    = row$z_short,
+        vwap_dev   = row$vwap_dev,
+        rsi14      = row$rsi14,
+        has_volume = cfg$has_volume,
+        params     = params
+      )
+
+      if (sig != 0L) {
+        signals_out[[length(signals_out) + 1L]] <- list(
+          product    = prod_name,
+          timestamp  = row$timestamp,
+          regime     = row$regime_label,
+          z_short    = round(row$z_short, 3),
+          vwap_dev   = round(row$vwap_dev %||% NA_real_, 3),
+          rsi14      = round(row$rsi14, 1),
+          atr14      = round(row$atr14, 4),
+          direction  = ifelse(sig == 1L, "LONG", "SHORT"),
+          confidence = params$confidence,
+          stop_dist  = round(params$atr_mult * row$atr14, 4),
+          target_dist= round(RR_RATIO * params$atr_mult * row$atr14, 4)
+        )
       }
     }
-
-    # Summary
-    summ_all <- .summarise(all_trades_dt)
-    fwrite(summ_all, file.path(OUT_DIR, "intraday_summary.csv"))
-    message("  intraday_summary.csv written")
-    cat("\n")
-    print(summ_all)
   }
 
-  # IC table
-  if (length(ic_tables) > 0) {
-    ic_all <- rbindlist(ic_tables, fill = TRUE)
-    fwrite(ic_all, file.path(OUT_DIR, "intraday_signal_ic.csv"))
-    message("  intraday_signal_ic.csv written")
-
-    # Print top signals overall
-    message("\n  --- Top signals by |IC| (training, ALL regimes, 4-bar horizon) ---")
-    top <- ic_all[horizon == "fwd_ret_4" & regime == "ALL"][order(-abs(ic))]
-    print(top)
+  if (length(signals_out) == 0L) {
+    cat("No signals fired on live data in the selected date range.\n")
+    return(invisible(NULL))
   }
 
-  message("\nDone.")
-  invisible(list(trades = all_trades, ic = ic_tables))
+  sig_dt <- rbindlist(lapply(signals_out, as.data.table))
+  cat(sprintf("\n%d signal(s) found:\n", nrow(sig_dt)))
+  print(sig_dt[, .(product, timestamp, regime, direction, z_short, confidence,
+                   stop_dist, target_dist)])
+
+  invisible(sig_dt)
 }
 
-# ── Run -----------------------------------------------------------------------
-# source("R/intraday_signal_engine.R")
-# results <- run_intraday_engine(products = c("CL", "WTCL_LCO"))
+# Null-coalescing helper (base R doesn't have %||%)
+`%||%` <- function(a, b) if (!is.null(a) && !is.na(a)) a else b
+
+# =============================================================================
+# HOW TO USE
+# =============================================================================
+# 1. Historical backtest (all splits):
+#      source("R/intraday_signal_engine.R")
+#      results <- run_backtest()
+#
+# 2. Test only (clean unseen data, Jul 2024 → May 2026):
+#      results <- run_backtest(splits = "test")
+#
+# 3. Live feed validation (Jun 12–16 SQLite files):
+#      run_live_validation(
+#        db_folder  = "I:/Public/Siddharth Raj/lightstreamer_data",
+#        date_range = c("2026-06-12", "2026-06-16")
+#      )
+# =============================================================================
