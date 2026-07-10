@@ -1,0 +1,19 @@
+model,r2,n,feature,coef,pval
+ret_4w ~ pos_z,0.0209,527,(Intercept),0.00062,0.9156
+ret_4w ~ pos_z,0.0209,527,pos_z,0.01957,9e-04
+ret_4w ~ pos_z + mm_chg_z,0.021,527,(Intercept),0.00062,0.9158
+ret_4w ~ pos_z + mm_chg_z,0.021,527,pos_z,0.01938,0.0011
+ret_4w ~ pos_z + mm_chg_z,0.021,527,mm_chg_z,0.00156,0.7918
+ret_4w ~ pos_z + dxy_z + sofr_z + td3c_z + sin_ann + cos_ann,0.1909,111,(Intercept),-0.00577,0.8904
+ret_4w ~ pos_z + dxy_z + sofr_z + td3c_z + sin_ann + cos_ann,0.1909,111,pos_z,-0.01222,0.6537
+ret_4w ~ pos_z + dxy_z + sofr_z + td3c_z + sin_ann + cos_ann,0.1909,111,dxy_z,-0.03088,0.0031
+ret_4w ~ pos_z + dxy_z + sofr_z + td3c_z + sin_ann + cos_ann,0.1909,111,sofr_z,-0.00975,0.8499
+ret_4w ~ pos_z + dxy_z + sofr_z + td3c_z + sin_ann + cos_ann,0.1909,111,td3c_z,-0.01847,0.1588
+ret_4w ~ pos_z + dxy_z + sofr_z + td3c_z + sin_ann + cos_ann,0.1909,111,sin_ann,-0.03363,0.0269
+ret_4w ~ pos_z + dxy_z + sofr_z + td3c_z + sin_ann + cos_ann,0.1909,111,cos_ann,-0.02045,0.1481
+ret_4w ~ dxy_z + sofr_z + td3c_z + sin_ann + cos_ann,0.1893,111,(Intercept),0.00782,0.7862
+ret_4w ~ dxy_z + sofr_z + td3c_z + sin_ann + cos_ann,0.1893,111,dxy_z,-0.03202,0.0015
+ret_4w ~ dxy_z + sofr_z + td3c_z + sin_ann + cos_ann,0.1893,111,sofr_z,-0.01169,0.8192
+ret_4w ~ dxy_z + sofr_z + td3c_z + sin_ann + cos_ann,0.1893,111,td3c_z,-0.02018,0.1066
+ret_4w ~ dxy_z + sofr_z + td3c_z + sin_ann + cos_ann,0.1893,111,sin_ann,-0.03581,0.0127
+ret_4w ~ dxy_z + sofr_z + td3c_z + sin_ann + cos_ann,0.1893,111,cos_ann,-0.02099,0.135

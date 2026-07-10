@@ -1,0 +1,3 @@
+model,n,r2,variable,coef_ols,pval_ols,coef_nw,pval_nw
+M1 CFTC only,156,0.0016,(Intercept),-0.005611,0.4634,-0.005611,0.6495
+M1 CFTC only,156,0.0016,pos_z,-0.004047,0.6157,-0.004047,0.7287

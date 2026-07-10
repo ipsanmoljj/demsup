@@ -1,0 +1,11 @@
+Assumption,"Model A
+Bai-Perron","Model B
+Kalman Filter","Model C
+Markov Switch","Model D
+ARIMA"
+Stationarity,MET ✓ (HAC robust),MET ✓ (handles drift),MET ✓ (by design),MET ✓
+No autocorrelation,MET ✓ (HAC robust),MET ✓ (state equation),MET ✓ (within-state),FAIL ✗ (fit within regime)
+Gaussian errors,FAIL ✗ (HAC SEs),FAIL ✗ (HAC SEs),FAIL ✗ (within-state),FAIL ✗ (HAC SEs)
+Homoskedasticity,MET ✓ (HAC robust),FAIL ✗ (switch var),FAIL ✗ (switch var),FAIL ✗ (rolling SD)
+Structural stability,FAIL ✗ (expected),MET ✓ (time-varying),MET ✓ (by design),FAIL ✗ (within-regime only)
+No outliers,MET ✓,MET ✓ (winsorise),MET ✓,MET ✓

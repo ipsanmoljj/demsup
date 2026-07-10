@@ -1,0 +1,6 @@
+delivery_month,expiry_date,pos_z_full,roll_compression,roll_reversion,model,cook_d,leverage,stud_res,flags,reason
+2021-04,2021-03-22,0.4424,-2.7181,2.7173,Stage 1 Full OLS,0.3872,0.0913,-2.94,2,Cook Stud
+2024-05,2024-04-22,-0.9319,2.566,-2.4817,Stage 1 Full OLS,0.0891,0.0176,3.407,2,Cook Stud
+2026-05,2026-04-21,-0.2545,-4.4914,3.1885,Stage 1 Full OLS,0.3927,0.0279,-6.905,2,Cook Stud
+2026-04,2026-03-20,-0.0806,-1.0426,4.8168,Stage 2 Full OLS,0.7238,0.0506,10.972,2,Cook Stud
+2026-05,2026-04-21,-0.2545,-4.4914,3.1885,Stage 2 Full OLS,0.7861,0.4532,-1.713,2,Cook Lev 

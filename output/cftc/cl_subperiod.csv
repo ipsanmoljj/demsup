@@ -1,0 +1,4 @@
+period,n,nw_lag,coef,pOLS,pNW,r2,avg_4w
+2021-2022 (COVID recovery + energy spike),99,4,-0.02043,0.0643,0.2215,0.0349,-1.15
+2023-2024 (post-energy-spike normalisation),57,3,0.09312,0,0,0.4245,0.53
+Full overlap (2021-2024),156,5,-0.00405,0.6157,0.7387,0.0016,-0.53

@@ -1,0 +1,56 @@
+=== CFTC Phase 2 Data Quality Report ===
+Generated: 2026-07-01 03:59:36
+
+--- CHECK 1: Expiry Date Coverage ---
+Total expiry events generated : 127
+Events with spread data      : 65
+  - CL_data TWAP (2021-2024) : 37
+  - regime_labels daily      : 28
+Events with NO spread data   : 62 (pre-2021, no EIA key)
+
+--- CHECK 2: CFTC Merge Quality ---
+Events with CFTC match       : 127 / 127
+CFTC days before expiry  mean: 11.1  range: 7 - 32
+CFTC readings > 14 days old  : 2
+  Stale CFTC events: CLM26, CLQ26
+
+--- CHECK 3: Spread Plausibility ---
+M1M2_pre_baseline distribution: min=-0.251  p10=-0.071  median=0.414  p90=1.620  max=6.223
+roll_compression distribution  : min=-4.491  p10=-0.547  median=-0.039  p90=0.562  max=2.566
+|roll_compression| > $5 events : 0 (flagged as potential data error)
+CLK20 (WTI negative price): pre_baseline=NA  compression=NA  [OUTLIER FLAGGED]
+
+--- CHECK 4: Markov State Merge ---
+Events with Markov state     : 124 / 127
+High-Vol (state=1): 65.3%  Low-Vol (state=2): 34.7%  (Phase 1: 63%/37%)
+Missing state: CLG16, CLK20, CLQ26
+
+--- CHECK 5: Regime Label Merge ---
+Events with regime label     : 67 / 127
+Regime label distribution:
+  Easing-Backwardation           : 17
+  Deep-Backwardation             : 12
+  Stable-Elevated                : 12
+  Backwardation-Deficit          : 8
+  Warm-Up                        : 8
+  Deep-Contango                  : 3
+  Contango-Surplus               : 2
+  Transition-Tightening          : 2
+  Easing-Contango                : 1
+  Stable-Depressed               : 1
+  Transition-Loosening           : 1
+
+--- CHECK 6: Seasonal Balance ---
+Expiries per calendar month:
+  Month  1: 11
+  Month  2: 11
+  Month  3: 11
+  Month  4: 11
+  Month  5: 11
+  Month  6: 11
+  Month  7: 11
+  Month  8: 10
+  Month  9: 10
+  Month 10: 10
+  Month 11: 10
+  Month 12: 10

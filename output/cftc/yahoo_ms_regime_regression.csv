@@ -1,0 +1,8 @@
+model,n,r2,pz,signal
+OLS (no regime),517,0.0019,0.3186,—
+Filtered binary,517,5e-04,0.6144,filtProb>0.5
+Smoothed binary,517,4e-04,0.6449,smoProb>0.5
+Filtered continuous,517,9e-04,0.4994,filtProb (0-1)
+Smoothed continuous,517,5e-04,0.6143,smoProb (0-1)
+Filtered + pos_z,517,0.0024,0.3222,filtProb>0.5 + pos_z
+Smoothed + pos_z,517,0.0023,0.3207,smoProb>0.5 + pos_z

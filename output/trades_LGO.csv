@@ -1,5 +1,9 @@
 date,window,product,regime,signal,level_z,entry_price,exit_price,exit_reason,bars_held,stop_dist,atr14,be_triggered,pnl_gross,pnl_net
+2025-06-23,test,LGO,Backwardation-Deficit,SELL,1.835,9.75,19.8629,stop_loss,7,10.1129,3.371,FALSE,-10.1129,-10.6129
+2025-06-24,test,LGO,Backwardation-Deficit,SELL,2.503,12.5943,23.1559,stop_loss,6,10.5616,3.5205,FALSE,-10.5616,-11.0616
+2025-06-25,test,LGO,Backwardation-Deficit,SELL,2.797,13.7381,23.2738,stop_loss,5,9.5357,3.1786,FALSE,-9.5357,-10.0357
 2025-06-26,test,LGO,Deep-Backwardation,SELL,3.662,17.25,26.7943,stop_loss,6,9.5443,3.1814,FALSE,-9.5443,-10.0443
+2025-06-27,test,LGO,Backwardation-Deficit,SELL,3.16,14.7403,24.558,stop_loss,4,9.8178,3.2726,FALSE,-9.8178,-10.3178
 2025-06-30,test,LGO,Deep-Backwardation,SELL,3.957,17.7332,27.7875,stop_loss,3,10.0543,3.3514,FALSE,-10.0543,-10.5543
 2025-07-01,test,LGO,Deep-Backwardation,SELL,5.399,23.4394,34.3702,stop_loss,3,10.9308,3.6436,FALSE,-10.9308,-11.4308
 2025-07-02,test,LGO,Deep-Backwardation,SELL,6.104,25.6667,36.9382,stop_loss,2,11.2716,3.7572,FALSE,-11.2716,-11.7716

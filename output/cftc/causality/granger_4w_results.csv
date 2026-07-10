@@ -1,0 +1,4 @@
+sample,n,lags,pos_ret_F_ols,pos_ret_p_ols,pos_ret_F_nw,pos_ret_p_nw,ret_pos_F_ols,ret_pos_p_ols,ret_pos_F_nw,ret_pos_p_nw
+Full Sample,512,4,1.32,0.2615,0.628,0.643,3.007,0.018,1.948,0.1013
+High-Vol,325,4,2.562,0.0385,1.119,0.3476,1.912,0.1082,1.595,0.1754
+Low-Vol,187,4,7.843,0,10.1,0,1.59,0.179,1.766,0.1377

@@ -1,0 +1,5 @@
+Model,Status,Required_adjustment,Key_concern
+A: Bai-Perron,PROCEED WITH HAC,Newey-West HAC standard errors (non-Gaussian errors),Fat tails (excess kurt=39.1) inflate type-I error
+B: Kalman Filter,PROCEED WITH CAUTION,Winsorise outliers before MLE; Consider time-varying H matrix; Check innovation residuals,Variance ratio=37723.3 — KF H may be misspecified in volatile periods
+C: Markov Switch,PROCEED AS-IS,Switching variance enabled (sw=TRUE) — OK; Check within-state residual normality; Verify state means are well-separated,Volatility clustering may cause state misclassification
+D: ARIMA,FIT WITHIN EACH REGIME SEPARATELY,Fit separate ARIMA per BP regime; Use rolling 63-day z-score for cross-regime comparison,ACF(1)=0.95 — high persistence; structural breaks violate stationarity assumption

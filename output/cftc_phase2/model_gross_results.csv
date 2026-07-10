@@ -1,0 +1,38 @@
+model,term,est,se,t,p,sig
+S1 Pooled: long_z + short_z,(Intercept),-0.061,0.1482,-0.412,0.6825,""
+S1 Pooled: long_z + short_z,mm_long_z,-0.0069,0.2103,-0.033,0.9741,""
+S1 Pooled: long_z + short_z,mm_short_z,-0.0915,0.1295,-0.707,0.4831,""
+S1 Pooled: ls_ratio_z,(Intercept),-0.0498,0.0967,-0.515,0.6089,""
+S1 Pooled: ls_ratio_z,ls_ratio_z,0.0188,0.1443,0.13,0.8969,""
+S1 Pooled: pos_z_full (net),(Intercept),-0.7625,0.4502,-1.694,0.0965,*
+S1 Pooled: pos_z_full (net),pos_z_full,-0.7651,0.4422,-1.73,0.0898,*
+S1 HV: long_z + short_z,(Intercept),-0.1708,0.1887,-0.905,0.3728,""
+S1 HV: long_z + short_z,mm_long_z,0.0579,0.3978,0.146,0.8853,""
+S1 HV: long_z + short_z,mm_short_z,-0.276,0.2444,-1.129,0.2681,""
+S1 LV: long_z + short_z,(Intercept),0.0394,0.1744,0.226,0.8238,""
+S1 LV: long_z + short_z,mm_long_z,0.1843,0.2311,0.797,0.4362,""
+S1 LV: long_z + short_z,mm_short_z,0.1468,0.0861,1.705,0.1063,""
+S1 Interaction: gross x HV,(Intercept),0.0394,0.1758,0.224,0.8235,""
+S1 Interaction: gross x HV,mm_long_z,0.1843,0.2518,0.732,0.4679,""
+S1 Interaction: gross x HV,hv,-0.2102,0.2938,-0.716,0.4778,""
+S1 Interaction: gross x HV,mm_short_z,0.1468,0.1269,1.157,0.2532,""
+S1 Interaction: gross x HV,mm_long_z:hv,-0.1264,0.4578,-0.276,0.7837,""
+S1 Interaction: gross x HV,hv:mm_short_z,-0.4228,0.2919,-1.448,0.1543,""
+S2 Pooled: long_z + short_z + comp,(Intercept),0.1738,0.1038,1.674,0.1006,""
+S2 Pooled: long_z + short_z + comp,mm_long_z,0.1879,0.1009,1.862,0.0688,*
+S2 Pooled: long_z + short_z + comp,mm_short_z,0.1405,0.0737,1.906,0.0627,*
+S2 Pooled: long_z + short_z + comp,roll_compression,-0.8523,0.1436,-5.935,0,***
+S2 Pooled: pos_z_full + comp,(Intercept),0.6999,0.4926,1.421,0.1618,""
+S2 Pooled: pos_z_full + comp,pos_z_full,0.6459,0.4512,1.432,0.1586,""
+S2 Pooled: pos_z_full + comp,roll_compression,-0.7748,0.1169,-6.628,0,***
+S2 Pooled: ls_ratio_z + comp,(Intercept),0.0906,0.0858,1.056,0.296,""
+S2 Pooled: ls_ratio_z + comp,ls_ratio_z,-0.0485,0.0942,-0.515,0.6088,""
+S2 Pooled: ls_ratio_z + comp,roll_compression,-0.8596,0.1468,-5.854,0,***
+S2 HV: long_z + short_z + comp,(Intercept),0.2716,0.1676,1.621,0.1162,""
+S2 HV: long_z + short_z + comp,mm_long_z,0.2606,0.1572,1.657,0.1087,""
+S2 HV: long_z + short_z + comp,mm_short_z,0.2232,0.15,1.488,0.148,""
+S2 HV: long_z + short_z + comp,roll_compression,-0.8554,0.1356,-6.311,0,***
+S2 LV: long_z + short_z + comp,(Intercept),-0.237,0.1228,-1.93,0.0715,*
+S2 LV: long_z + short_z + comp,mm_long_z,-0.4526,0.1772,-2.554,0.0212,**
+S2 LV: long_z + short_z + comp,mm_short_z,-0.1317,0.0584,-2.256,0.0385,**
+S2 LV: long_z + short_z + comp,roll_compression,-0.5564,0.06,-9.27,0,***

@@ -109,7 +109,37 @@ SFM_TIERS_LINEAR <- list(
                         "hdd_dev_5yr_z", "cdd_us_ne", "gasoil_crack_dev_z",
                         "sin_ann", "cos_ann",
                         "driving_season", "heating_season", "turnaround_season",
-                        "sx_cushing", "sx_td3c", "sx_cftc", "sx_5yr_dev", "sx_util")
+                        "sx_cushing", "sx_td3c", "sx_cftc", "sx_5yr_dev", "sx_util"),
+  # ── Tier 5: expanded feature set ──────────────────────────────────────────────
+  # Adds: EIA streak, total petroleum balance, absolute surprise, product 5yr
+  # deficits, China imports, HO crack, days forward cover, spread momentum,
+  # and two new interaction terms (streak × surprise, abs × surprise).
+  sfm_t5_enhanced = c(
+    "surprise_z", "cushing_stocks_chg_z",
+    "gasoline_stocks_chg_z", "distillate_stocks_chg_z",
+    "crude_prod_chg_z", "crude_net_exports_z",
+    "total_petrol_surprise_z",    # crude + gasoline + distillate net balance
+    "abs_surprise_z",              # non-linear magnitude signal
+    "eia_streak_4w",               # 4-week lagged EIA surprise momentum
+    "crude_stocks_5yr_dev_z", "cushing_stocks_5yr_dev_z",
+    "gasoline_5yr_dev_z",          # product structural deficit
+    "distillate_5yr_dev_z",        # product structural deficit
+    "days_fwd_cover_z",            # crude days forward cover
+    "cftc_net_mm_zscore", "cftc_mm_net_chg_z",
+    "td3c_z52", "td3c_wow_ws_z", "bdi_z52",
+    "dxy_z", "dxy_4wk_chg_z", "sofr_z",
+    "china_imports_z",             # Chinese crude import demand
+    "opec_prod_z", "rig_chg_wow_z", "refinery_util_dev",
+    "hdd_dev_5yr_z", "cdd_us_ne",
+    "ho_crack_dev_z",              # HO crack deviation (distillate demand signal)
+    "gasoil_crack_dev_z",
+    "m1m2_mom_z",                  # 4-week change in m1m2 before EIA event
+    "sin_ann", "cos_ann",
+    "driving_season", "heating_season", "turnaround_season",
+    "sx_cushing", "sx_td3c", "sx_cftc", "sx_5yr_dev", "sx_util",
+    "sx_streak",                   # surprise × EIA streak
+    "sx_abs"                       # surprise × |surprise| (convex reaction)
+  )
 )
 
 # Tree tiers use same features as their linear counterparts
@@ -117,7 +147,9 @@ SFM_TIERS_TREE <- list(
   old_t3_rf  = SFM_TIERS_LINEAR[["old_t3_full"]],
   old_t3_xgb = SFM_TIERS_LINEAR[["old_t3_full"]],
   sfm_t4_rf  = SFM_TIERS_LINEAR[["sfm_t4_combined"]],
-  sfm_t4_xgb = SFM_TIERS_LINEAR[["sfm_t4_combined"]]
+  sfm_t4_xgb = SFM_TIERS_LINEAR[["sfm_t4_combined"]],
+  sfm_t5_rf  = SFM_TIERS_LINEAR[["sfm_t5_enhanced"]],
+  sfm_t5_xgb = SFM_TIERS_LINEAR[["sfm_t5_enhanced"]]
 )
 
 SFM_TIERS <- c(SFM_TIERS_LINEAR, SFM_TIERS_TREE)
@@ -273,7 +305,7 @@ SFM_TIERS <- c(SFM_TIERS_LINEAR, SFM_TIERS_TREE)
     if (!col %in% names(inv)) inv[, (col) := 0]
   if (!"refinery_util_dev" %in% names(inv)) inv[, refinery_util_dev := 0]
 
-  # Interaction terms
+  # Interaction terms (Tier 4 and below)
   inv[, sx_cushing := surprise_z * cushing_stocks_chg_z]
   inv[, sx_util    := surprise_z * refinery_util_dev]
   inv[, sx_td3c    := surprise_z * td3c_z52]
@@ -281,6 +313,65 @@ SFM_TIERS <- c(SFM_TIERS_LINEAR, SFM_TIERS_TREE)
   inv[, sx_5yr_dev := surprise_z * crude_stocks_5yr_dev_z]
   for (ic in c("sx_cushing", "sx_util", "sx_td3c", "sx_cftc", "sx_5yr_dev"))
     inv[!is.finite(get(ic)), (ic) := 0]
+
+  # ── Tier 5 new features ───────────────────────────────────────────────────────
+
+  # Additional z-score features from factors_extended.csv
+  raw_z_map2 <- list(
+    gasoline_5yr_dev_z      = "gasoline_stocks_5yr_dev",
+    distillate_5yr_dev_z    = "distillate_stocks_5yr_dev",
+    days_fwd_cover_z        = "days_fwd_cover_proxy",
+    china_imports_z         = "china_imports_proxy",
+    ho_crack_dev_z          = "ho_crack_proxy",
+    crude_net_exports_4wk_z = "crude_net_exports_4wk"
+  )
+  for (zc in names(raw_z_map2)) {
+    rc <- raw_z_map2[[zc]]
+    if (rc %in% names(inv)) {
+      v <- .to_num(inv[[rc]])  # coerce; handles character-encoded numerics
+      inv[, (zc) := .sfm_zscore(v, tr)]
+    } else {
+      inv[, (zc) := 0]
+    }
+  }
+
+  # EIA surprise streak: rolling mean of last 4 prior surprises (no look-ahead)
+  inv[, eia_streak_4w := {
+    lagged <- shift(surprise_z, 1L)
+    frollmean(lagged, n = 4L, align = "right", na.rm = TRUE)
+  }]
+  inv[is.na(eia_streak_4w), eia_streak_4w := 0]
+
+  # Absolute surprise magnitude (for non-linear effects in linear models)
+  inv[, abs_surprise_z := abs(surprise_z)]
+
+  # Total petroleum balance surprise (crude + gasoline + distillate, all in kb)
+  tpc_cols <- c("crude_stocks_chg", "gasoline_stocks_chg", "distillate_stocks_chg")
+  tpc_mat  <- vapply(tpc_cols, function(col) {
+    v <- if (col %in% names(inv)) inv[[col]] else rep(0, nrow(inv))
+    v[!is.finite(v)] <- 0; v
+  }, numeric(nrow(inv)))
+  inv[, total_petrol_chg        := rowSums(tpc_mat)]
+  inv[, total_petrol_surprise_z := .sfm_zscore(total_petrol_chg, tr)]
+  inv[!is.finite(total_petrol_surprise_z), total_petrol_surprise_z := 0]
+
+  # New interaction terms
+  inv[, sx_streak := surprise_z * eia_streak_4w]
+  inv[, sx_abs    := surprise_z * abs_surprise_z]
+  inv[!is.finite(sx_streak), sx_streak := 0]
+  inv[!is.finite(sx_abs),    sx_abs    := 0]
+
+  # Spread momentum: 4-week change in m1m2 before each EIA event
+  sp_m1m2  <- spreads[!is.na(m1m2), .(date, m1m2)][order(date)]
+  mom_vals <- vapply(inv$date, function(rd) {
+    idx_now <- which(sp_m1m2$date <= rd)
+    idx_prv <- which(sp_m1m2$date <= rd - 28L)
+    if (!length(idx_now) || !length(idx_prv)) return(NA_real_)
+    sp_m1m2$m1m2[tail(idx_now, 1L)] - sp_m1m2$m1m2[tail(idx_prv, 1L)]
+  }, numeric(1))
+  inv[, m1m2_mom   := mom_vals]
+  inv[, m1m2_mom_z := .sfm_zscore(m1m2_mom, tr)]
+  inv[!is.finite(m1m2_mom_z), m1m2_mom_z := 0]
 
   # Compute 2-day spread changes
   tgts  <- c("m1m2", "m2m3", "m1m6", "fly123", "fly136")
@@ -732,7 +823,8 @@ run_spread_factor_model <- function(root = NULL, train_frac = SFM_TRAIN_FRAC) {
 # Focus tiers: best performer from each estimator family
 SFM_REGIME_TIERS <- c("old_t3_full", "old_t3_xgb",
                        "sfm_t4_combined", "sfm_t4_xgb",
-                       "sfm_t3_structural")
+                       "sfm_t3_structural",
+                       "sfm_t5_enhanced", "sfm_t5_xgb")
 
 SFM_REGIME_MIN_EVENTS <- 25L   # minimum events per regime to attempt a split
 
